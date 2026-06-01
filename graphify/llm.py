@@ -145,6 +145,33 @@ def _load_custom_providers() -> dict[str, dict]:
 BACKENDS.update(_load_custom_providers())
 
 
+# Valid values for the service_tier parameter (Gemini / OpenAI).
+_VALID_SERVICE_TIERS = frozenset({"flex", "standard", "priority"})
+
+
+def _resolve_service_tier() -> str | None:
+    """Return the service tier from GRAPHIFY_SERVICE_TIER env var, or None.
+
+    Gemini and OpenAI support ``service_tier`` to trade latency for cost:
+    - ``flex``     — 50% cheaper, 1-15 min target latency (ideal for batch extraction)
+    - ``standard`` — default balanced tier
+    - ``priority`` — lowest latency, premium pricing
+
+    Returns None when unset so the API uses its own default (standard).
+    """
+    raw = os.environ.get("GRAPHIFY_SERVICE_TIER", "").strip().lower()
+    if not raw:
+        return None
+    if raw not in _VALID_SERVICE_TIERS:
+        print(
+            f"[graphify] warning: GRAPHIFY_SERVICE_TIER={raw!r} is not valid; "
+            f"expected one of {sorted(_VALID_SERVICE_TIERS)}. Ignoring.",
+            file=sys.stderr,
+        )
+        return None
+    return raw
+
+
 def _resolve_max_tokens(default: int) -> int:
     """Honour GRAPHIFY_MAX_OUTPUT_TOKENS env var override, else use backend default."""
     raw = os.environ.get("GRAPHIFY_MAX_OUTPUT_TOKENS", "").strip()
@@ -387,6 +414,12 @@ def _call_openai_compat(
         kwargs["temperature"] = temperature
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
+    # service_tier: trade latency for cost on Gemini / OpenAI backends.
+    # "flex" = 50% discount with 1-15 min target latency — ideal for bulk
+    # semantic extraction where per-chunk latency is irrelevant.
+    service_tier = _resolve_service_tier()
+    if service_tier is not None and backend in ("gemini", "openai", "deepseek"):
+        kwargs["service_tier"] = service_tier
     # Kimi-k2.6 is a reasoning model — disable thinking so content isn't empty
     if "moonshot" in base_url:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
