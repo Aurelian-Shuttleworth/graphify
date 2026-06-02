@@ -1383,7 +1383,7 @@ def label_communities(
         "its name - no prose, no markdown fences.\n\n" + "\n".join(lines)
     )
 
-    max_tokens = min(40 + 16 * len(labeled_cids), 4096)
+    max_tokens = min(40 + 25 * len(labeled_cids), 16384)
     text = _call_llm(prompt, backend=backend, max_tokens=max_tokens)
     labels.update(_parse_label_response(text, labeled_cids))
     return labels
