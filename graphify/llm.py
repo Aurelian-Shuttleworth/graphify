@@ -1118,7 +1118,7 @@ def _merge_into(merged: dict, result: dict) -> None:
     merged["output_tokens"] += result.get("output_tokens", 0)
 
 
-def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
+def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200, response_format: dict | None = None) -> str:
     """Send a plain-text prompt to `backend` and return the model's text reply.
 
     Used by lightweight callers (e.g. `graphify.dedup` LLM tiebreaker) that
@@ -1212,6 +1212,8 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
         kwargs["reasoning_effort"] = cfg["reasoning_effort"]
     if "moonshot" in cfg["base_url"]:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    if response_format is not None:
+        kwargs["response_format"] = response_format
     resp = client.chat.completions.create(**kwargs)
     if not resp.choices or resp.choices[0].message is None:
         raise ValueError("LLM returned empty or filtered response")
@@ -1384,7 +1386,8 @@ def label_communities(
     )
 
     max_tokens = min(40 + 25 * len(labeled_cids), 16384)
-    text = _call_llm(prompt, backend=backend, max_tokens=max_tokens)
+    text = _call_llm(prompt, backend=backend, max_tokens=max_tokens,
+                     response_format={"type": "json_object"})
     labels.update(_parse_label_response(text, labeled_cids))
     return labels
 
