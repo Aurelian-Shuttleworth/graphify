@@ -1365,30 +1365,45 @@ def label_communities(
     gods=None,
     max_communities: int = _LABEL_MAX_COMMUNITIES,
     top_k: int = _LABEL_TOP_K,
+    batch_size: int = 50,
 ) -> dict[int, str]:
     """Return a complete ``{cid: name}`` map using ``backend`` for naming.
 
-    Placeholders (``Community N``) are used for any community the backend did not
-    name. Raises on backend/parse failure - callers that want graceful
-    degradation should use :func:`generate_community_labels`.
+    Communities are labeled in batches of ``batch_size`` to avoid output
+    truncation on large vaults. Placeholders (``Community N``) are used for
+    any community the backend did not name. Raises on backend/parse failure -
+    callers that want graceful degradation should use
+    :func:`generate_community_labels`.
     """
     labels = _placeholder_community_labels(communities)
     lines, labeled_cids = _community_label_lines(G, communities, gods, max_communities, top_k)
     if not lines:
         return labels
 
-    prompt = (
+    _LABEL_PROMPT_PREFIX = (
         "You are naming clusters in a knowledge graph. For each community below, "
         "return a concise 2-5 word plain-language name describing what it is about "
         "(e.g. \"Order Management\", \"Payment Flow\", \"Auth Middleware\"). "
         "Respond ONLY with a JSON object mapping the community id (as a string) to "
-        "its name - no prose, no markdown fences.\n\n" + "\n".join(lines)
+        "its name - no prose, no markdown fences.\n\n"
     )
 
-    max_tokens = min(40 + 25 * len(labeled_cids), 16384)
-    text = _call_llm(prompt, backend=backend, max_tokens=max_tokens,
-                     response_format={"type": "json_object"})
-    labels.update(_parse_label_response(text, labeled_cids))
+    # Split into batches to avoid output truncation
+    for i in range(0, len(lines), batch_size):
+        batch_lines = lines[i:i + batch_size]
+        batch_cids = labeled_cids[i:i + batch_size]
+        prompt = _LABEL_PROMPT_PREFIX + "\n".join(batch_lines)
+        max_tokens = min(40 + 25 * len(batch_cids), 8192)
+        try:
+            text = _call_llm(prompt, backend=backend, max_tokens=max_tokens,
+                             response_format={"type": "json_object"})
+            labels.update(_parse_label_response(text, batch_cids))
+            print(f"  Batch {i // batch_size + 1}: labeled {len(batch_cids)} communities", file=sys.stderr)
+        except Exception as exc:
+            print(
+                f"  Batch {i // batch_size + 1}: failed ({exc}); keeping placeholders for {len(batch_cids)} communities",
+                file=sys.stderr,
+            )
     return labels
 
 
