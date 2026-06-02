@@ -1338,6 +1338,42 @@ def _community_label_lines(G, communities, gods, max_communities, top_k):
     return lines, labeled_cids
 
 
+def _repair_json(text: str) -> str:
+    """Best-effort repair of common LLM JSON failures.
+
+    Handles: truncated strings, trailing commas, incomplete objects.
+    Returns the repaired text (may still be invalid).
+    """
+    text = text.strip()
+    # Remove markdown fences
+    text = _LABEL_FENCE_RE.sub("", text).strip()
+    # Find the JSON object
+    start = text.find("{")
+    if start == -1:
+        return text
+    text = text[start:]
+    # If JSON is truncated mid-string, close it
+    # Count unescaped quotes to detect unterminated strings
+    in_string = False
+    last_good = 0
+    for idx, ch in enumerate(text):
+        if ch == '\\' and in_string:
+            continue  # skip escaped chars
+        if ch == '"' and (idx == 0 or text[idx - 1] != '\\'):
+            in_string = not in_string
+        if not in_string and ch in (',', '}'):
+            last_good = idx
+    if in_string:
+        # Truncated inside a string — close it and close the object
+        text = text[:last_good + 1].rstrip(",") + "}"
+    elif not text.rstrip().endswith("}"):
+        # Truncated but not in a string — try to close
+        text = text.rstrip().rstrip(",") + "}"
+    # Remove trailing commas before }
+    text = re.sub(r",\s*}", "}", text)
+    return text
+
+
 def _parse_label_response(text: str, labeled_cids: list[int]) -> dict[int, str]:
     """Parse the backend's JSON ``{cid: name}`` reply. Raises on non-JSON or a
     non-object payload; silently ignores cids it didn't name."""
@@ -1396,16 +1432,26 @@ def label_communities(
         batch_cids = labeled_cids[i:i + batch_size]
         prompt = _LABEL_PROMPT_PREFIX + "\n".join(batch_lines)
         max_tokens = min(40 + 25 * len(batch_cids), 8192)
-        try:
-            text = _call_llm(prompt, backend=backend, max_tokens=max_tokens,
-                             response_format={"type": "json_object"})
-            labels.update(_parse_label_response(text, batch_cids))
-            print(f"  Batch {i // batch_size + 1}: labeled {len(batch_cids)} communities", file=sys.stderr)
-        except Exception as exc:
-            print(
-                f"  Batch {i // batch_size + 1}: failed ({exc}); keeping placeholders for {len(batch_cids)} communities",
-                file=sys.stderr,
-            )
+        batch_num = i // batch_size + 1
+        succeeded = False
+        for attempt in range(3):
+            try:
+                text = _call_llm(prompt, backend=backend, max_tokens=max_tokens,
+                                 response_format={"type": "json_object"})
+                # Try to repair common JSON issues before parsing
+                text = _repair_json(text)
+                labels.update(_parse_label_response(text, batch_cids))
+                print(f"  Batch {batch_num}: labeled {len(batch_cids)} communities", file=sys.stderr)
+                succeeded = True
+                break
+            except Exception as exc:
+                if attempt < 2:
+                    print(f"  Batch {batch_num}: attempt {attempt+1} failed ({exc}); retrying...", file=sys.stderr)
+                else:
+                    print(
+                        f"  Batch {batch_num}: failed after 3 attempts ({exc}); keeping placeholders for {len(batch_cids)} communities",
+                        file=sys.stderr,
+                    )
     return labels
 
 
