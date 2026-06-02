@@ -1300,7 +1300,7 @@ def detect_backend() -> str | None:
 # batched call and return a complete ``{cid: name}`` map (#1097).
 
 _LABEL_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
-_LABEL_MAX_COMMUNITIES = 200   # cap LLM-named communities; tail stays placeholder
+_LABEL_MAX_COMMUNITIES = 400   # cap LLM-named communities; tail stays placeholder
 _LABEL_TOP_K = 12              # node labels sampled per community for the prompt
 _LABEL_MAXLEN = 60             # truncate individual labels to keep the prompt small
 
