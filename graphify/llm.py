@@ -1324,6 +1324,8 @@ def _community_label_lines(G, communities, gods, max_communities, top_k):
         seen: set[str] = set()
         for nid in ranked:
             label = str(G.nodes[nid].get("label", nid)) if nid in G.nodes else str(nid)
+            # Strip chars that the model tends to echo back unescaped inside JSON strings
+            label = label.replace('"', '').replace('{', '').replace('}', '')
             label = label.strip().strip("()")[:_LABEL_MAXLEN]
             if label and label.lower() not in seen:
                 seen.add(label.lower())
