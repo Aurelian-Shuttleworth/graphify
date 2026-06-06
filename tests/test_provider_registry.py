@@ -70,7 +70,7 @@ def test_custom_provider_cannot_shadow_builtin(tmp_path):
 
 
 def test_detect_backend_custom_provider_after_builtins(monkeypatch):
-    """Custom providers appear after all built-ins in detect_backend() priority."""
+    """Custom providers with unique keys appear after all built-ins in detect_backend() priority."""
     from graphify import llm
 
     monkeypatch.setattr(llm, "BACKENDS", {
@@ -93,3 +93,58 @@ def test_detect_backend_custom_provider_after_builtins(monkeypatch):
 
     result = llm.detect_backend()
     assert result == "myprovider"
+
+
+def test_detect_backend_custom_provider_shadows_builtin_env_key(monkeypatch):
+    """A custom provider sharing a built-in's env_key wins over that built-in.
+
+    Reproduces the OpenRouter bug: OPENAI_API_KEY is set with an OpenRouter
+    key, and a custom 'openrouter' provider is configured via providers.json.
+    detect_backend() should return 'openrouter', not 'openai'.
+    """
+    from graphify import llm
+
+    monkeypatch.setattr(llm, "BACKENDS", {
+        **llm.BACKENDS,
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "default_model": "mistralai/mistral-small-2603",
+            "env_key": "OPENAI_API_KEY",
+            "pricing": {"input": 0.2, "output": 0.6},
+            "temperature": 0,
+        }
+    })
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-or-v1-test-key")
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "MOONSHOT_API_KEY", "ANTHROPIC_API_KEY",
+                 "DEEPSEEK_API_KEY", "OLLAMA_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    result = llm.detect_backend()
+    assert result == "openrouter", (
+        f"Expected 'openrouter' but got '{result}'; custom provider sharing "
+        f"OPENAI_API_KEY should take priority over built-in 'openai'"
+    )
+
+
+def test_detect_backend_builtin_wins_when_no_custom_shadows(monkeypatch):
+    """Built-in 'openai' still wins when no custom provider shares its env_key."""
+    from graphify import llm
+
+    # Remove any custom providers that might shadow openai
+    backends_clean = {k: v for k, v in llm.BACKENDS.items()
+                      if k != "openrouter"}
+    monkeypatch.setattr(llm, "BACKENDS", backends_clean)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "MOONSHOT_API_KEY", "ANTHROPIC_API_KEY",
+                 "DEEPSEEK_API_KEY", "OLLAMA_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    result = llm.detect_backend()
+    assert result == "openai"
+

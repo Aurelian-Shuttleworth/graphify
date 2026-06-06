@@ -1248,7 +1248,14 @@ def _validate_ollama_base_url(url: str) -> None:
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
-    Priority: gemini → kimi → claude → openai → bedrock → ollama (last, opt-in).
+    Priority:
+      1. Custom providers that share an env_key with a built-in (explicit user
+         override — e.g. openrouter configured with OPENAI_API_KEY should win
+         over the built-in openai backend).
+      2. Built-in backends: gemini → kimi → claude → openai → deepseek.
+      3. AWS Bedrock (credential-based, no env_key).
+      4. Ollama (intentionally last — see F-002/F-029).
+      5. Custom providers with their own unique env_key.
 
     Ollama is intentionally checked LAST so a paid API key (Anthropic/OpenAI/etc.)
     is never silently shadowed by an incidental OLLAMA_BASE_URL in the environment
@@ -1256,6 +1263,25 @@ def detect_backend() -> str | None:
     key now keeps you on the paid backend; remove the paid key (or pass
     --backend ollama explicitly) to route to the local model.
     """
+    _BUILTIN_NAMES = ("gemini", "kimi", "claude", "openai", "deepseek", "bedrock", "ollama", "claude-cli")
+
+    # Collect env_keys claimed by built-in backends for shadowing detection.
+    _builtin_env_keys: set[str] = set()
+    for name in _BUILTIN_NAMES:
+        if name in BACKENDS:
+            _builtin_env_keys.update(_backend_env_keys(name))
+
+    # Phase 1: Custom providers that shadow a built-in env_key get priority.
+    # The user explicitly configured a custom endpoint for that key.
+    for name in BACKENDS:
+        if name in _BUILTIN_NAMES:
+            continue
+        provider_keys = set(_backend_env_keys(name))
+        if provider_keys & _builtin_env_keys:  # shares at least one env_key
+            if _get_backend_api_key(name):
+                return name
+
+    # Phase 2: Built-in backends in preferred order.
     for backend in ("gemini", "kimi", "claude", "openai", "deepseek"):
         if _get_backend_api_key(backend):
             return backend
@@ -1265,10 +1291,14 @@ def detect_backend() -> str | None:
     if ollama_url:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
+
+    # Phase 3: Custom providers with unique env_keys (no built-in collision).
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "bedrock", "ollama", "claude-cli"):
-            if _get_backend_api_key(name):
-                return name
+        if name not in _BUILTIN_NAMES:
+            provider_keys = set(_backend_env_keys(name))
+            if not (provider_keys & _builtin_env_keys):  # unique key
+                if _get_backend_api_key(name):
+                    return name
     return None
 
 
