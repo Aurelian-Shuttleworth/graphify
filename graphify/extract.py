@@ -10630,6 +10630,90 @@ def _resolve_nix_import(path_text: str, source_file: Path) -> Path | None:
 
 
 def extract_nix(path: Path) -> dict:
+    """Extract semantic nodes and edges from a .nix file using the LSP client."""
+    from .lsp_client import LspClient
+    import hashlib
+    
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes = []
+    edges = []
+    seen_ids = set()
+
+    def add_node(nid: str, label: str, line: int, snippet: str = "") -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid, "label": label, "file_type": "code",
+                "source_file": str_path, "source_location": f"L{line}",
+                "snippet": snippet
+            })
+
+    # Read the file
+    try:
+        source = path.read_bytes()
+        source_text = source.decode("utf-8", errors="replace")
+        lines = source_text.split('\n')
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    # Add the file node
+    file_nid = _make_id(str_path)
+    add_node(file_nid, path.name, 1, source_text)
+
+    # LSP extraction
+    try:
+        client = LspClient("nil")
+        client.start()
+        
+        root_uri = f"file://{path.parent.absolute()}"
+        uri = f"file://{path.absolute()}"
+        
+        client.initialize(root_uri)
+        client.did_open(uri, source_text)
+        symbols = client.document_symbol(uri)
+        
+        def process_symbol(sym, parent_path=""):
+            name = sym.get("name", "Unknown")
+            
+            # Construct a fully qualified name for better RAG context
+            full_name = f"{parent_path}.{name}" if parent_path else name
+            
+            start_line = sym.get("range", {}).get("start", {}).get("line", 0)
+            end_line = sym.get("range", {}).get("end", {}).get("line", len(lines) - 1)
+            
+            # Slice the source text for the snippet
+            snippet = "\n".join(lines[start_line:end_line+1])
+            
+            nid = _make_id(stem, full_name)
+            
+            add_node(nid, full_name, start_line + 1, snippet)
+            
+            # Edge linking this node to its parent (or the file if root)
+            parent_nid = _make_id(stem, parent_path) if parent_path else file_nid
+            edges.append({
+                "source": nid, "target": parent_nid, "relation": "CONTAINS",
+                "confidence": "EXTRACTED", "source_file": str_path,
+                "source_location": f"L{start_line + 1}", "weight": 1.0,
+            })
+            
+            if "children" in sym:
+                for child in sym["children"]:
+                    process_symbol(child, full_name)
+
+        for sym in symbols:
+            process_symbol(sym)
+            
+        client.stop()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # Fallback to tree-sitter if nil fails or times out
+        return _extract_nix_treesitter(path)
+        
+    return {"nodes": nodes, "edges": edges}
+
+def _extract_nix_treesitter(path: Path) -> dict:
     """Extract functions, bindings, imports, and NixOS module patterns from a .nix file."""
     try:
         nix_lang = _get_nix_language()
