@@ -126,8 +126,25 @@ def _custom_providers_path(global_: bool = True) -> Path:
 
 
 def _load_custom_providers() -> dict[str, dict]:
+    """Load custom provider definitions from JSON files.
+
+    Search order (later files override earlier ones for the same key):
+      1. .graphify/providers.json  (project-local)
+      2. ~/.graphify/providers.json (user-global)
+      3. $GRAPHIFY_PROVIDERS_PATH   (env override — highest priority)
+
+    The env var enables Nix, container, and CI deployments to inject a
+    store-resident or read-only providers.json without touching $HOME.
+    """
     providers: dict[str, dict] = {}
-    for path in (_custom_providers_path(global_=False), _custom_providers_path(global_=True)):
+    paths: list[Path] = [
+        _custom_providers_path(global_=False),
+        _custom_providers_path(global_=True),
+    ]
+    env_path = os.environ.get("GRAPHIFY_PROVIDERS_PATH", "").strip()
+    if env_path:
+        paths.append(Path(env_path))
+    for path in paths:
         if path.is_file():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
