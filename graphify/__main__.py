@@ -2692,6 +2692,12 @@ def main() -> None:
         no_label = "--no-label" in sys.argv
         _backend_arg = next((a for a in sys.argv if a.startswith("--backend=")), None)
         label_backend = _backend_arg.split("=", 1)[1] if _backend_arg else None
+        # Also accept space-separated: --backend openrouter
+        if label_backend is None:
+            for _i, _a in enumerate(sys.argv):
+                if _a == "--backend" and _i + 1 < len(sys.argv):
+                    label_backend = sys.argv[_i + 1]
+                    break
         _min_cs_arg = next((a for a in sys.argv if a.startswith("--min-community-size=")), None)
         min_community_size = int(_min_cs_arg.split("=")[1]) if _min_cs_arg else 3
         args = sys.argv[2:]
@@ -2712,8 +2718,12 @@ def main() -> None:
                 co_exclude_hubs = float(args[i_arg + 1]); i_arg += 2
             elif a.startswith("--exclude-hubs="):
                 co_exclude_hubs = float(a.split("=", 1)[1]); i_arg += 1
-            elif a == "--no-viz" or a.startswith("--min-community-size="):
-                i_arg += 1
+            elif a == "--no-viz" or a.startswith("--min-community-size=") or a.startswith("--backend"):
+                # --backend / --backend=X already parsed above; skip value if space-separated
+                if a == "--backend" and i_arg + 1 < len(args):
+                    i_arg += 2
+                else:
+                    i_arg += 1
             elif a.startswith("--"):
                 i_arg += 1
             elif watch_path is None:
