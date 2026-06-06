@@ -389,7 +389,40 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
     return output
 
 
-def _query_graph_text(
+def _subgraph_to_json(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
+    """Return a JSON representation of the subgraph suitable for TOON formatting."""
+    import json
+    seed_set = set(seeds or [])
+    ordered = [n for n in (seeds or []) if n in nodes] + \
+              sorted(nodes - seed_set, key=lambda n: G.degree(n), reverse=True)
+    out_nodes = []
+    for nid in ordered:
+        d = G.nodes[nid]
+        out_nodes.append({
+            "id": nid,
+            "label": d.get("label", nid),
+            "source_file": str(d.get("source_file", "")),
+            "source_location": str(d.get("source_location", "")),
+            "community": str(d.get("community", "")),
+        })
+    out_edges = []
+    for u, v in edges:
+        if u in nodes and v in nodes:
+            raw = G[u][v]
+            d = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
+            edge_obj = {
+                "source": u,
+                "target": v,
+                "relation": str(d.get("relation", "")),
+                "confidence": str(d.get("confidence", "")),
+            }
+            if "context" in d:
+                edge_obj["context"] = str(d["context"])
+            out_edges.append(edge_obj)
+    return json.dumps({"nodes": out_nodes, "edges": out_edges})
+
+
+def _query_graph(
     G: nx.Graph,
     question: str,
     *,
@@ -397,6 +430,7 @@ def _query_graph_text(
     depth: int = 3,
     token_budget: int = 2000,
     context_filters: list[str] | None = None,
+    format: str = "text",
 ) -> str:
     terms = _query_terms(question)
     scored = _score_nodes(G, terms)
@@ -414,7 +448,9 @@ def _query_graph_text(
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+    if format == "json":
+        return _subgraph_to_json(traversal_graph, nodes, edges, token_budget, seeds=start_nodes)
+    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=start_nodes)
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
@@ -543,6 +579,12 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
                             "items": {"type": "string"},
                             "description": "Optional explicit edge-context filter, e.g. ['call', 'field']",
                         },
+                        "format": {
+                            "type": "string",
+                            "enum": ["text", "json"],
+                            "default": "text",
+                            "description": "Output format: text for LLMs, json for mcp2cli --toon",
+                        },
                     },
                     "required": ["question"],
                 },
@@ -654,13 +696,15 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         depth = min(int(arguments.get("depth", 3)), 6)
         budget = int(arguments.get("token_budget", 2000))
         context_filter = arguments.get("context_filter")
-        return _query_graph_text(
+        fmt = arguments.get("format", "text")
+        return _query_graph(
             G,
             question,
             mode=mode,
             depth=depth,
             token_budget=budget,
             context_filters=context_filter,
+            format=fmt,
         )
 
     def _tool_get_node(arguments: dict) -> str:
