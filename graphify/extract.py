@@ -10523,6 +10523,492 @@ def extract_dmf(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# ── Nix ──────────────────────────────────────────────────────────────────────
+
+_NIX_BUILTIN_BLOCKLIST = frozenset({
+    "import", "builtins", "throw", "abort", "toString", "toJSON", "fromJSON",
+    "map", "filter", "foldl", "head", "tail", "length", "elem",
+    "attrNames", "attrValues", "hasAttr", "getAttr", "removeAttrs",
+    "listToAttrs", "catAttrs", "intersectAttrs",
+    "isNull", "isString", "isInt", "isList", "isAttrs", "isBool", "isFunction",
+    "typeOf", "tryEval", "deepSeq", "seq",
+    "replaceStrings", "substring", "stringLength", "concatStringsSep",
+    "trace", "traceVerbose",
+    "fetchurl", "fetchTarball", "fetchGit",
+    "derivation", "placeholder", "baseNameOf", "dirOf",
+    "toFile", "toPath", "pathExists", "readFile", "readDir",
+    "currentSystem", "currentTime", "nixVersion",
+    "null", "true", "false",
+})
+
+_NIX_LIB_BLOCKLIST = frozenset({
+    "mkIf", "mkMerge", "mkDefault", "mkForce", "mkOverride",
+    "mkOption", "mkEnableOption", "mkPackageOption",
+    "mapAttrs", "filterAttrs", "mapAttrsToList", "concatMapAttrs",
+    "optionalAttrs", "optionalString", "optional",
+    "concatMap", "concatLists", "flatten", "unique", "sort",
+    "nameValuePair", "literalExpression",
+    "types", "lib",
+})
+
+
+def _get_nix_language():
+    """Load tree-sitter-nix: Nix store .so first, PyPI fallback second."""
+    import os as _os
+    grammar_path = _os.environ.get("GRAPHIFY_TREE_SITTER_NIX_PATH")
+    if grammar_path:
+        import ctypes
+        from tree_sitter import Language
+        lib = ctypes.CDLL(grammar_path)
+        func = lib.tree_sitter_nix
+        func.restype = ctypes.c_void_p
+        return Language(func())
+    import tree_sitter_nix
+    from tree_sitter import Language
+    return Language(tree_sitter_nix.language())
+
+
+def _prescan_nix_bindings(node, source: bytes) -> set[str]:
+    """Pre-pass: collect all binding names in the file for call resolution."""
+    names: set[str] = set()
+
+    def _scan(n):
+        if n.type == "binding":
+            attr = n.child_by_field_name("attrpath")
+            if attr is None:
+                attr = n.child_by_field_name("name")
+            if attr is not None:
+                name_text = source[attr.start_byte:attr.end_byte].decode("utf-8", errors="replace")
+                if "." not in name_text:
+                    names.add(name_text)
+        for child in n.children:
+            _scan(child)
+
+    _scan(node)
+    return names
+
+
+def _is_nix_module(root, source: bytes) -> bool:
+    """Detect NixOS module pattern: { config, lib, ... }: body."""
+    target = root
+    # Unwrap source_code wrapper
+    if target.type == "source_code" and target.named_child_count == 1:
+        target = target.named_children[0]
+    # Unwrap top-level let: `let ... in { config, lib, ... }: body`
+    if target.type == "let_expression":
+        body = target.child_by_field_name("body")
+        if body is not None:
+            target = body
+    if target.type != "function_expression":
+        return False
+    formals = target.child_by_field_name("formals")
+    if formals is None:
+        return False
+    param_names = set()
+    for child in formals.named_children:
+        if child.type == "formal":
+            name_node = child.child_by_field_name("name")
+            if name_node:
+                param_names.add(source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace"))
+    return bool(param_names & {"config", "lib", "pkgs"})
+
+
+def _resolve_nix_import(path_text: str, source_file: Path) -> Path | None:
+    """Resolve a Nix path expression to an absolute path, with security guards."""
+    if path_text.startswith("<") or path_text.startswith("$"):
+        return None  # search paths / interpolation — can't resolve
+    try:
+        resolved = (source_file.parent / path_text).resolve()
+    except (ValueError, OSError):
+        return None
+    if not resolved.exists():
+        return None
+    if resolved.is_dir():
+        default = resolved / "default.nix"
+        return default if default.exists() else None
+    return resolved
+
+
+def extract_nix(path: Path) -> dict:
+    """Extract functions, bindings, imports, and NixOS module patterns from a .nix file."""
+    try:
+        nix_lang = _get_nix_language()
+        from tree_sitter import Parser
+    except (ImportError, OSError, AttributeError):
+        return {"nodes": [], "edges": [], "error": "tree-sitter-nix not available"}
+
+    try:
+        parser = Parser(nix_lang)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+        # Unwrap source_code wrapper (tree-sitter-nix wraps everything in source_code)
+        if root.type == "source_code" and root.named_child_count == 1:
+            root = root.named_children[0]
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    module_scope = path.parent.name or stem
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    raw_calls: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_call_pairs: set[tuple[str, str]] = set()
+    function_bodies: list[tuple[str, object]] = []
+
+    def text(node) -> str:
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    def add_node(nid: str, label: str, line: int, kind: str = "code") -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid, "label": label, "file_type": "code",
+                "source_file": str_path, "source_location": f"L{line}",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 context: str | None = None) -> None:
+        if not src or not tgt or src == tgt:
+            return
+        edge: dict = {
+            "source": src, "target": tgt, "relation": relation,
+            "confidence": "EXTRACTED", "source_file": str_path,
+            "source_location": f"L{line}", "weight": 1.0,
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def ensure_named_node(name: str, line: int) -> str:
+        nid = _make_id(stem, name)
+        if nid in seen_ids:
+            return nid
+        nid_global = _make_id(name)
+        if nid_global in seen_ids:
+            return nid_global
+        add_node(nid_global, name, line)
+        return nid_global
+
+    # --- Pass 0: prescan ---
+    defined_names = _prescan_nix_bindings(root, source)
+
+    # --- File + module nodes ---
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    is_module = _is_nix_module(root, source)
+    entry_nid = file_nid
+    if is_module:
+        entry_nid = file_nid + "__module"
+        add_node(entry_nid, f"{path.stem} module", 1)
+        add_edge(file_nid, entry_nid, "contains", 1)
+
+    # --- Pass 1: walk ---
+    def walk(node, parent_nid: str) -> None:
+        line = node.start_point[0] + 1
+
+        # ── binding: name = value; ──
+        if node.type == "binding":
+            attr = node.child_by_field_name("attrpath")
+            if attr is None:
+                attr = node.child_by_field_name("name")
+            expr = node.child_by_field_name("expression")
+            if attr is not None and expr is not None:
+                name_text = text(attr)
+                # Determine the scope nid for children of this binding
+                binding_parent_nid = parent_nid
+
+                if "." not in name_text:
+                    # Simple (non-dotted) binding — create a node
+                    if expr.type == "function_expression":
+                        nid = _make_id(stem, name_text)
+                        add_node(nid, f"{name_text}()", line)
+                        add_edge(parent_nid, nid, "contains", line)
+                        function_bodies.append((nid, expr))
+                        return  # function bodies are walked in pass 2
+                    elif expr.type in ("attrset_expression", "rec_attrset_expression"):
+                        nid = _make_id(stem, name_text)
+                        add_node(nid, name_text, line)
+                        add_edge(parent_nid, nid, "contains", line)
+                        binding_parent_nid = nid
+                    else:
+                        nid = _make_id(stem, name_text)
+                        add_node(nid, name_text, line)
+                        add_edge(parent_nid, nid, "contains", line)
+
+                # ── NixOS pattern: mkOption / mkEnableOption ──
+                # Detect inside both simple and dotted bindings
+                _check_nix_option_pattern(expr, name_text, parent_nid, line)
+
+                # ── import detection in binding values ──
+                if expr.type == "apply_expression":
+                    _check_import_expr(expr, parent_nid, line)
+
+                # Always recurse into the expression value for nested patterns
+                walk(expr, binding_parent_nid)
+            return  # don't recurse into binding children via default path
+
+        # ── import / callPackage at expression level ──
+        if node.type == "apply_expression":
+            _check_import_expr(node, parent_nid, line)
+
+        # ── inherit (with source) — `inherit (src) x y;` ──
+        if node.type == "inherit_from":
+            from_node = None
+            for child in node.named_children:
+                if child.type not in ("identifier", "attrpath"):
+                    # The source expression (e.g. `defaults` in `inherit (defaults) ...`)
+                    if from_node is None and child.type != "inherit_from":
+                        from_node = child
+                    continue
+                sym_name = text(child)
+                sym_nid = _make_id(stem, sym_name)
+                add_node(sym_nid, sym_name, line)
+                if from_node is not None:
+                    from_text = text(from_node)
+                    from_nid = ensure_named_node(from_text, line)
+                    add_edge(sym_nid, from_nid, "imports_from", line, context="inherit")
+                else:
+                    add_edge(parent_nid, sym_nid, "contains", line)
+            return
+
+        # ── inherit (plain) — `inherit x y;` ──
+        if node.type == "inherit":
+            for child in node.named_children:
+                if child.type in ("identifier", "attrpath"):
+                    sym_name = text(child)
+                    sym_nid = _make_id(stem, sym_name)
+                    add_node(sym_nid, sym_name, line)
+                    add_edge(parent_nid, sym_nid, "contains", line)
+            return
+
+        # ── binding_set (wrapper inside let_expression) ──
+        if node.type == "binding_set":
+            for child in node.named_children:
+                walk(child, parent_nid)
+            return
+
+        # ── let expression ──
+        if node.type == "let_expression":
+            for child in node.named_children:
+                walk(child, parent_nid)
+            body = node.child_by_field_name("body")
+            if body is not None:
+                walk(body, parent_nid)
+            return
+
+        # ── with expression ──
+        if node.type == "with_expression":
+            env = node.child_by_field_name("environment")
+            if env is not None:
+                scope_name = text(env)
+                scope_nid = ensure_named_node(scope_name, line)
+                add_edge(parent_nid, scope_nid, "references", line, context="with_scope")
+            body = node.child_by_field_name("body")
+            if body is not None:
+                walk(body, parent_nid)
+            return
+
+        # ── function expression (top-level anonymous) ──
+        if node.type == "function_expression":
+            # If this is the module body function, walk its body
+            body = node.child_by_field_name("body")
+            if body is not None:
+                walk(body, parent_nid)
+            return
+
+        # ── mkIf detection ──
+        # mkIf is curried: `mkIf cond body` parses as `(apply (apply mkIf cond) body)`
+        if node.type == "apply_expression":
+            callee = node.child_by_field_name("function")
+            if callee is not None and callee.type == "apply_expression":
+                inner_fn = callee.child_by_field_name("function")
+                inner_arg = callee.child_by_field_name("argument")
+                if inner_fn is not None:
+                    inner_fn_text = text(inner_fn)
+                    if inner_fn_text in ("mkIf", "lib.mkIf"):
+                        if inner_arg is not None:
+                            cond_text = text(inner_arg)
+                            cond_parts = cond_text.split(".")
+                            if len(cond_parts) >= 2:
+                                cond_nid = ensure_named_node(cond_text, line)
+                                add_edge(parent_nid, cond_nid, "guarded_by", line)
+                        # Walk the body argument (the second curried arg)
+                        body_arg = node.child_by_field_name("argument")
+                        if body_arg is not None:
+                            walk(body_arg, parent_nid)
+                        return
+
+        # ── list of path imports: imports = [ ./a ./b ] ──
+        if node.type == "list_expression":
+            for child in node.named_children:
+                if child.type == "path_expression":
+                    path_text = text(child)
+                    resolved = _resolve_nix_import(path_text, path)
+                    if resolved:
+                        tgt_nid = _make_id(str(resolved))
+                        add_edge(parent_nid, tgt_nid, "imports_from", line, context="import")
+
+        # ── config.X.Y references ──
+        if node.type == "select_expression":
+            full_text = text(node)
+            if full_text.startswith("config.") or full_text.startswith("cfg."):
+                ref_nid = ensure_named_node(full_text, line)
+                add_edge(parent_nid, ref_nid, "references", line, context="config_ref")
+            # Don't recurse into select_expression children to avoid duplicates
+            return
+
+        # ── Default: recurse into children ──
+        for child in node.named_children:
+            walk(child, parent_nid)
+
+    def _check_nix_option_pattern(expr_node, name_text: str, parent_nid: str, line: int) -> None:
+        """Detect mkOption / mkEnableOption patterns, handling curried application."""
+        target = expr_node
+        # Unwrap curried application to find the innermost function
+        while target.type == "apply_expression":
+            callee = target.child_by_field_name("function")
+            if callee is None:
+                break
+            callee_text = text(callee)
+            if "mkOption" in callee_text and "mkEnableOption" not in callee_text:
+                opt_nid = _make_id(module_scope, name_text)
+                add_node(opt_nid, f"options.{name_text}", line)
+                add_edge(parent_nid, opt_nid, "contains", line)
+                return
+            elif "mkEnableOption" in callee_text:
+                opt_nid = _make_id(module_scope, "enable")
+                add_node(opt_nid, "enable", line)
+                add_edge(parent_nid, opt_nid, "contains", line)
+                return
+            # Try inner function (for curried calls)
+            target = callee
+
+    def _check_import_expr(node, parent_nid: str, line: int) -> None:
+        """Detect import ./path and callPackage ./path {} patterns."""
+        callee = node.child_by_field_name("function")
+        arg = node.child_by_field_name("argument")
+        if callee is None:
+            return
+
+        callee_text = text(callee)
+
+        # import ./path.nix
+        if callee_text == "import" and arg is not None:
+            if arg.type == "path_expression":
+                path_text = text(arg)
+                resolved = _resolve_nix_import(path_text, path)
+                if resolved:
+                    tgt_nid = _make_id(str(resolved))
+                    add_edge(parent_nid, tgt_nid, "imports_from", line, context="import")
+            elif arg.type == "apply_expression":
+                # import ./path.nix { inherit lib; }
+                inner_arg = arg.child_by_field_name("function")
+                if inner_arg is not None and inner_arg.type == "path_expression":
+                    path_text = text(inner_arg)
+                    resolved = _resolve_nix_import(path_text, path)
+                    if resolved:
+                        tgt_nid = _make_id(str(resolved))
+                        add_edge(parent_nid, tgt_nid, "imports_from", line, context="import")
+
+        # callPackage ./path.nix { }
+        elif "callPackage" in callee_text:
+            if arg is not None and arg.type == "path_expression":
+                path_text = text(arg)
+                resolved = _resolve_nix_import(path_text, path)
+                if resolved:
+                    tgt_nid = _make_id(str(resolved))
+                    add_edge(parent_nid, tgt_nid, "imports_from", line, context="callPackage")
+            # callPackage ./path { overrides }  — the path is the function arg
+            # which gets curried: (callPackage ./path) { overrides }
+            elif callee.type == "apply_expression":
+                inner_fn = callee.child_by_field_name("function")
+                inner_arg = callee.child_by_field_name("argument")
+                if inner_fn is not None and "callPackage" in text(inner_fn):
+                    if inner_arg is not None and inner_arg.type == "path_expression":
+                        path_text = text(inner_arg)
+                        resolved = _resolve_nix_import(path_text, path)
+                        if resolved:
+                            tgt_nid = _make_id(str(resolved))
+                            add_edge(parent_nid, tgt_nid, "imports_from", line, context="callPackage")
+
+    walk(root, entry_nid if is_module else file_nid)
+
+    # --- Pass 2: walk_calls ---
+    label_to_nid: dict[str, str] = {}
+    for n in nodes:
+        key = n["label"].strip("()").lstrip(".")
+        if key not in label_to_nid:
+            label_to_nid[key] = n["id"]
+
+    def walk_calls(node, caller_nid: str, seen: set[str]) -> None:
+        if node.type == "binding":
+            return  # don't descend into nested bindings
+        if node.type == "apply_expression":
+            callee = node.child_by_field_name("function")
+            if callee is not None:
+                # Unwrap curried application: ((f a) b) → get innermost function
+                while callee.type == "apply_expression":
+                    inner = callee.child_by_field_name("function")
+                    if inner is None:
+                        break
+                    callee = inner
+
+                if callee.type == "identifier":
+                    callee_name = text(callee)
+                    line = callee.start_point[0] + 1
+                    if (callee_name not in _NIX_BUILTIN_BLOCKLIST
+                            and callee_name not in _NIX_LIB_BLOCKLIST
+                            and callee_name not in _LANGUAGE_BUILTIN_GLOBALS):
+                        target_nid = label_to_nid.get(callee_name)
+                        if target_nid and target_nid != caller_nid:
+                            pair = (caller_nid, target_nid)
+                            if pair not in seen_call_pairs:
+                                seen_call_pairs.add(pair)
+                                add_edge(caller_nid, target_nid, "calls", line, context="call")
+                        elif target_nid is None and callee_name in defined_names:
+                            raw_calls.append({
+                                "caller_nid": caller_nid,
+                                "callee": callee_name,
+                                "is_member_call": False,
+                                "source_file": str_path,
+                                "source_location": f"L{line}",
+                            })
+                elif callee.type == "select_expression":
+                    # lib.mkIf, pkgs.callPackage etc. — extract last segment
+                    callee_full = text(callee)
+                    parts = callee_full.split(".")
+                    callee_name = parts[-1] if parts else callee_full
+                    line = callee.start_point[0] + 1
+                    if (callee_name not in _NIX_BUILTIN_BLOCKLIST
+                            and callee_name not in _NIX_LIB_BLOCKLIST
+                            and callee_name not in _LANGUAGE_BUILTIN_GLOBALS):
+                        target_nid = label_to_nid.get(callee_name)
+                        if target_nid and target_nid != caller_nid:
+                            pair = (caller_nid, target_nid)
+                            if pair not in seen_call_pairs:
+                                seen_call_pairs.add(pair)
+                                add_edge(caller_nid, target_nid, "calls", line, context="call")
+
+        for child in node.named_children:
+            walk_calls(child, caller_nid, seen)
+
+    for fn_nid, body in function_bodies:
+        walk_calls(body, fn_nid, set())
+
+    # --- Edge cleanup ---
+    valid_ids = seen_ids
+    edges[:] = [e for e in edges
+                if e["source"] in valid_ids
+                and (e["target"] in valid_ids
+                     or e["relation"] in ("imports", "imports_from"))]
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
+
+
 _DISPATCH: dict[str, Any] = {
     ".py": extract_python,
     ".js": extract_js,
@@ -10590,6 +11076,7 @@ _DISPATCH: dict[str, Any] = {
     ".lpk": extract_lazarus_package,
     ".sh": extract_bash,
     ".bash": extract_bash,
+    ".nix": extract_nix,
     ".json": extract_json,
     ".dm": extract_dm,
     ".dme": extract_dm,

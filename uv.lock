@@ -1109,7 +1109,7 @@ wheels = [
 
 [[package]]
 name = "graphifyy"
-version = "0.8.24"
+version = "0.8.28"
 source = { editable = "." }
 dependencies = [
     { name = "datasketch" },
@@ -1121,7 +1121,6 @@ dependencies = [
     { name = "tree-sitter-c" },
     { name = "tree-sitter-c-sharp" },
     { name = "tree-sitter-cpp" },
-    { name = "tree-sitter-dm" },
     { name = "tree-sitter-elixir" },
     { name = "tree-sitter-fortran" },
     { name = "tree-sitter-go" },
@@ -1160,6 +1159,8 @@ all = [
     { name = "pypdf" },
     { name = "python-docx" },
     { name = "tiktoken" },
+    { name = "tree-sitter-dm" },
+    { name = "tree-sitter-nix" },
     { name = "tree-sitter-sql" },
     { name = "watchdog" },
     { name = "yt-dlp" },
@@ -1169,6 +1170,9 @@ bedrock = [
 ]
 chinese = [
     { name = "jieba" },
+]
+dm = [
+    { name = "tree-sitter-dm" },
 ]
 gemini = [
     { name = "openai" },
@@ -1189,6 +1193,9 @@ mcp = [
 ]
 neo4j = [
     { name = "neo4j" },
+]
+nix = [
+    { name = "tree-sitter-nix" },
 ]
 office = [
     { name = "openpyxl" },
@@ -1279,7 +1286,8 @@ requires-dist = [
     { name = "tree-sitter-c" },
     { name = "tree-sitter-c-sharp" },
     { name = "tree-sitter-cpp" },
-    { name = "tree-sitter-dm" },
+    { name = "tree-sitter-dm", marker = "extra == 'all'" },
+    { name = "tree-sitter-dm", marker = "extra == 'dm'" },
     { name = "tree-sitter-elixir" },
     { name = "tree-sitter-fortran" },
     { name = "tree-sitter-go" },
@@ -1290,6 +1298,8 @@ requires-dist = [
     { name = "tree-sitter-julia" },
     { name = "tree-sitter-kotlin" },
     { name = "tree-sitter-lua" },
+    { name = "tree-sitter-nix", marker = "extra == 'all'" },
+    { name = "tree-sitter-nix", marker = "extra == 'nix'" },
     { name = "tree-sitter-objc" },
     { name = "tree-sitter-php" },
     { name = "tree-sitter-powershell" },
@@ -1308,7 +1318,7 @@ requires-dist = [
     { name = "yt-dlp", marker = "extra == 'all'" },
     { name = "yt-dlp", marker = "extra == 'video'" },
 ]
-provides-extras = ["mcp", "neo4j", "pdf", "watch", "svg", "leiden", "office", "google", "video", "kimi", "ollama", "bedrock", "gemini", "openai", "chinese", "sql", "all"]
+provides-extras = ["mcp", "neo4j", "pdf", "watch", "svg", "leiden", "office", "google", "video", "kimi", "ollama", "bedrock", "gemini", "openai", "chinese", "sql", "dm", "nix", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -4688,6 +4698,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/da/d9ce9a35c3042b2fd7453ba69d543d32c5d09563277a099b0859ce53d919/tree_sitter_lua-0.5.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:922a5a3d0fec8af373cab504cbcd9abeeebb212d454f54163591c50c183466be", size = 41357, upload-time = "2026-02-26T17:07:31.408Z" },
     { url = "https://files.pythonhosted.org/packages/25/20/8973f4049d81b2920ef496cf61b9b947ccee63dfb1aa89cb73810cb22784/tree_sitter_lua-0.5.0-cp310-abi3-win_amd64.whl", hash = "sha256:ace3dd61218124ee08410a55601cb5fbbb00be3ee004b30e705cef9ef25165a9", size = 24755, upload-time = "2026-02-26T17:07:32.128Z" },
     { url = "https://files.pythonhosted.org/packages/8c/97/3104ecfa3c34320411bcad9b4f2823956487b6e222edcc83689819badc9d/tree_sitter_lua-0.5.0-cp310-abi3-win_arm64.whl", hash = "sha256:8488f3bea40779896f5771bcfcdc26900eb21e94f6658eb68a848fc37dd39221", size = 23506, upload-time = "2026-02-26T17:07:32.775Z" },
+]
+
+[[package]]
+name = "tree-sitter-nix"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/c2/10d8983cfaf9c336befe77bb0ef4e058b05ca2208589288e84cb83691e15/tree_sitter_nix-0.1.0.tar.gz", hash = "sha256:b551fd00fbbac92f300fa941f3c41b661f290c141559de0f690d5509d9ac3cb0", size = 45118, upload-time = "2025-02-20T03:55:14.869Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/eb/8f88901abe6718121584a2a9aae10e27e56297c604e39033ad5d4f4b3dd6/tree_sitter_nix-0.1.0-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:be2cb442e8aa71ba1be9c18928c1e61ba7c421b7adb18139152b6b753eaf34a5", size = 26396, upload-time = "2025-02-20T03:55:03.309Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/73/76d81928226298d1c36bac819b028364d8aa1abc3eead9f8b054917c99fd/tree_sitter_nix-0.1.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:1c666eb12f5fc326a4a12f1cb555d93da6e5934947b038a95829cd2533e662d7", size = 26705, upload-time = "2025-02-20T03:55:05.887Z" },
+    { url = "https://files.pythonhosted.org/packages/94/7f/cf33867470f717267e60b717ae1085ccd7fae48681406b3605a216f48fd3/tree_sitter_nix-0.1.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:25df7005d9188968347d97f5980b5fd780000f340ce1e5db198447bf208c8871", size = 43938, upload-time = "2025-02-20T03:55:07.615Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/2f/0dc49a8b3683bdf9cf8542d0d4eb2c508e9f01f4234574f4ad7f859a1d0b/tree_sitter_nix-0.1.0-cp310-abi3-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:58c07f788bc6d24b7a90aff49431de57c3933c5c54d1008125da2073f1bc45de", size = 43798, upload-time = "2025-02-20T03:55:09.082Z" },
+    { url = "https://files.pythonhosted.org/packages/de/ff/f205cb90d539ee4b877f4dd7a8b90a36a6f29c22a8188da7e43bab0aa1ec/tree_sitter_nix-0.1.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:1694d9d012026bd2c9ac57812a43c438458177dad35c549022cf93b4539f0023", size = 43168, upload-time = "2025-02-20T03:55:10.016Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/a9/27e60501f6a219d01c747b0ae9abf1db23dc3f7e8582e327d2016503a13a/tree_sitter_nix-0.1.0-cp310-abi3-win_amd64.whl", hash = "sha256:9294bf94c2ece0b4e64c32f0de57b9ac861577bae81fac2dfabf954cfd25700e", size = 27649, upload-time = "2025-02-20T03:55:11.371Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/61/53e710982ad9e01d98ec9ffe800a13dc993725b7f242e92123f1c6e2dd5a/tree_sitter_nix-0.1.0-cp310-abi3-win_arm64.whl", hash = "sha256:0e0f32ff065fb70c637fce5e6b5b19ae7e4b5a5d3de8ea01133df7ca1a425b0a", size = 25800, upload-time = "2025-02-20T03:55:12.809Z" },
 ]
 
 [[package]]
