@@ -95,10 +95,9 @@ class TestFlakeNix:
     """Validate extraction of the top-level flake.nix.
 
     Structure: { description; inputs = { ... }; outputs = inputs@{ ... }: ... }
-    The outputs function body contains let bindings and imports, but the
-    walker extracts function bodies for call resolution only — so top-level
-    tests focus on what the walker *does* extract: the inputs attrset
-    structure and the outputs function node.
+    The walker walks function bodies for both structure and calls, so the
+    outputs() body's let bindings, imports, and nested attrsets are all
+    extracted as nodes and edges.
     """
 
     @pytest.fixture(autouse=True)
@@ -160,9 +159,26 @@ class TestFlakeNix:
         _assert_no_dangling_sources(self.r, FLAKE_ROOT / "flake.nix")
 
     def test_node_count(self):
-        """Flake with ~14 inputs should produce a decent node count."""
-        assert len(self.r["nodes"]) >= 10, \
-            f"expected ≥10 nodes, got {len(self.r['nodes'])}"
+        """Flake with inputs + outputs body should produce 25+ nodes."""
+        assert len(self.r["nodes"]) >= 25, \
+            f"expected ≥25 nodes (inputs + function body content), got {len(self.r['nodes'])}"
+
+    def test_function_body_let_bindings(self):
+        """outputs() body let bindings should be extracted."""
+        labels = set(_labels(self.r))
+        expected = {"username", "system", "stateVersion", "constants"}
+        found = expected & labels
+        assert len(found) >= 3, \
+            f"expected let bindings from outputs body, found: {found} in {labels}"
+
+    def test_function_body_imports(self):
+        """outputs() body contains import edges (./nix/shell.nix, etc.)."""
+        imports = _edges_by_relation(self.r, "imports_from")
+        assert len(imports) >= 1, \
+            f"expected import edges from outputs body, got {len(imports)}"
+
+    def test_has_import_relation(self):
+        assert "imports_from" in _relations(self.r)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,13 +493,13 @@ class TestFullFlakeSweep:
     def test_total_node_count(self):
         """The full flake should produce a rich graph."""
         total_nodes = sum(len(r["nodes"]) for r in self.results.values())
-        assert total_nodes >= 200, \
-            f"expected ≥200 total nodes across flake, got {total_nodes}"
+        assert total_nodes >= 1000, \
+            f"expected ≥1000 total nodes across flake, got {total_nodes}"
 
     def test_total_edge_count(self):
         total_edges = sum(len(r["edges"]) for r in self.results.values())
-        assert total_edges >= 150, \
-            f"expected ≥150 total edges, got {total_edges}"
+        assert total_edges >= 1000, \
+            f"expected ≥1000 total edges, got {total_edges}"
 
     def test_no_dangling_edges_anywhere(self):
         """No file in the entire flake should have dangling source edges."""

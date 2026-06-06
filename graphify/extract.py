@@ -10997,7 +10997,8 @@ def extract_nix(path: Path) -> dict:
             walk_calls(child, caller_nid, seen)
 
     for fn_nid, body in function_bodies:
-        walk_calls(body, fn_nid, set())
+        walk(body, fn_nid)                  # structural pass (bindings, imports, guards)
+        walk_calls(body, fn_nid, set())     # call resolution pass
 
     # --- Edge cleanup ---
     valid_ids = seen_ids
