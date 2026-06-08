@@ -10630,88 +10630,147 @@ def _resolve_nix_import(path_text: str, source_file: Path) -> Path | None:
 
 
 def extract_nix(path: Path) -> dict:
-    """Extract semantic nodes and edges from a .nix file using the LSP client."""
-    from .lsp_client import LspClient
-    import hashlib
-    
+    """Extract semantic nodes and edges from a .nix file via tree-sitter.
+
+    LSP enrichment (hierarchical labels, source snippets) is applied as a
+    batch post-pass in extract() when the ``nil`` LSP server is available.
+    This function focuses purely on structural + semantic extraction.
+    """
+    return _extract_nix_treesitter(path)
+
+
+def _lsp_symbols_for_file(
+    client,
+    path: Path,
+    source_text: str,
+) -> dict:
+    """Get LSP document symbols for a single file using an existing client session.
+
+    Returns ``{node_id: {"label": str, "snippet": str, "source_location": str}}``
+    or ``{}`` on any error.  The caller is responsible for calling
+    ``client.did_close()`` afterwards.
+    """
     stem = _file_stem(path)
-    str_path = str(path)
-    nodes = []
-    edges = []
-    seen_ids = set()
+    uri = f"file://{path.absolute()}"
+    lines = source_text.split("\n")
 
-    def add_node(nid: str, label: str, line: int, snippet: str = "") -> None:
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({
-                "id": nid, "label": label, "file_type": "code",
-                "source_file": str_path, "source_location": f"L{line}",
-                "snippet": snippet
-            })
+    client.did_open(uri, source_text)
+    symbols = client.document_symbol(uri)
 
-    # Read the file
+    lsp_nodes: dict[str, dict] = {}
+
+    def process_symbol(sym, parent_path=""):
+        name = sym.get("name", "Unknown")
+        full_name = f"{parent_path}.{name}" if parent_path else name
+        start_line = sym.get("range", {}).get("start", {}).get("line", 0)
+        end_line = sym.get("range", {}).get("end", {}).get("line", len(lines) - 1)
+        snippet = "\n".join(lines[start_line : end_line + 1])
+        nid = _make_id(stem, full_name)
+
+        lsp_nodes[nid] = {
+            "label": full_name,
+            "snippet": snippet,
+            "source_location": f"L{start_line + 1}",
+        }
+
+        for child in sym.get("children", []):
+            process_symbol(child, full_name)
+
+    for sym in symbols:
+        process_symbol(sym)
+
+    client.did_close(uri)
+    return lsp_nodes
+
+
+def _batch_lsp_enrich_nix(
+    nix_indices: list[int],
+    paths: list[Path],
+    per_file: list[dict],
+) -> int:
+    """Enrich ``.nix`` extraction results with LSP data using a shared ``nil`` session.
+
+    Opens a single ``nil`` process, iterates all ``.nix`` files, and merges
+    hierarchical labels + snippets into the tree-sitter nodes.
+
+    Returns the number of files successfully enriched.
+    """
+    import shutil
+    from .lsp_client import LspClient
+
+    if not shutil.which("nil"):
+        return 0
+
+    # Determine workspace root (common ancestor of all .nix paths).
+    nix_paths = [paths[i] for i in nix_indices]
+    if not nix_paths:
+        return 0
+
+    if len(nix_paths) == 1:
+        workspace_root = nix_paths[0].parent.absolute()
+    else:
+        parts_lists = [p.absolute().parts for p in nix_paths]
+        common_len = 0
+        for i in range(min(len(pts) for pts in parts_lists)):
+            if len({pts[i] for pts in parts_lists}) == 1:
+                common_len = i + 1
+            else:
+                break
+        workspace_root = Path(*parts_lists[0][:common_len]) if common_len else Path("/")
+
+    enriched = 0
     try:
-        source = path.read_bytes()
-        source_text = source.decode("utf-8", errors="replace")
-        lines = source_text.split('\n')
+        with LspClient("nil") as client:
+            client.initialize(f"file://{workspace_root}")
+
+            for idx in nix_indices:
+                path = paths[idx]
+                result = per_file[idx]
+
+                try:
+                    source_text = path.read_text(encoding="utf-8", errors="replace")
+                    lsp_nodes = _lsp_symbols_for_file(client, path, source_text)
+                except Exception:
+                    continue  # skip this file, keep tree-sitter result
+
+                if not lsp_nodes:
+                    continue
+
+                # Merge: enrich existing tree-sitter nodes with LSP data.
+                existing_ids = {n["id"] for n in result.get("nodes", [])}
+                for node in result.get("nodes", []):
+                    lsp = lsp_nodes.get(node["id"])
+                    if lsp:
+                        if lsp.get("label"):
+                            node["label"] = lsp["label"]
+                        if lsp.get("snippet"):
+                            node["snippet"] = lsp["snippet"]
+
+                # Add LSP-only nodes (symbols tree-sitter missed).
+                str_path = str(path)
+                for nid, lsp_node in lsp_nodes.items():
+                    if nid not in existing_ids:
+                        result["nodes"].append(
+                            {
+                                "id": nid,
+                                "label": lsp_node["label"],
+                                "file_type": "code",
+                                "source_file": str_path,
+                                "source_location": lsp_node["source_location"],
+                                "snippet": lsp_node.get("snippet", ""),
+                            }
+                        )
+
+                enriched += 1
+
     except Exception as e:
-        return {"nodes": [], "edges": [], "error": str(e)}
+        import logging
 
-    # Add the file node
-    file_nid = _make_id(str_path)
-    add_node(file_nid, path.name, 1, source_text)
+        logging.getLogger(__name__).warning(
+            "LSP batch enrichment failed, keeping tree-sitter results: %s", e
+        )
 
-    # LSP extraction
-    try:
-        client = LspClient("nil")
-        client.start()
-        
-        root_uri = f"file://{path.parent.absolute()}"
-        uri = f"file://{path.absolute()}"
-        
-        client.initialize(root_uri)
-        client.did_open(uri, source_text)
-        symbols = client.document_symbol(uri)
-        
-        def process_symbol(sym, parent_path=""):
-            name = sym.get("name", "Unknown")
-            
-            # Construct a fully qualified name for better RAG context
-            full_name = f"{parent_path}.{name}" if parent_path else name
-            
-            start_line = sym.get("range", {}).get("start", {}).get("line", 0)
-            end_line = sym.get("range", {}).get("end", {}).get("line", len(lines) - 1)
-            
-            # Slice the source text for the snippet
-            snippet = "\n".join(lines[start_line:end_line+1])
-            
-            nid = _make_id(stem, full_name)
-            
-            add_node(nid, full_name, start_line + 1, snippet)
-            
-            # Edge linking this node to its parent (or the file if root)
-            parent_nid = _make_id(stem, parent_path) if parent_path else file_nid
-            edges.append({
-                "source": nid, "target": parent_nid, "relation": "CONTAINS",
-                "confidence": "EXTRACTED", "source_file": str_path,
-                "source_location": f"L{start_line + 1}", "weight": 1.0,
-            })
-            
-            if "children" in sym:
-                for child in sym["children"]:
-                    process_symbol(child, full_name)
-
-        for sym in symbols:
-            process_symbol(sym)
-            
-        client.stop()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # Fallback to tree-sitter if nil fails or times out
-        return _extract_nix_treesitter(path)
-        
-    return {"nodes": nodes, "edges": edges}
+    return enriched
 
 def _extract_nix_treesitter(path: Path) -> dict:
     """Extract functions, bindings, imports, and NixOS module patterns from a .nix file."""
@@ -11427,6 +11486,21 @@ def extract(
     for i in range(total):
         if per_file[i] is None:
             per_file[i] = {"nodes": [], "edges": []}
+
+    # LSP batch enrichment for .nix files (shared nil session).
+    # Runs after per-file tree-sitter extraction so every .nix result already
+    # has its full edge set; this pass only enriches node labels and adds
+    # source snippets.  Entirely skipped when nil is not on PATH.
+    nix_indices = [i for i, p in enumerate(paths) if p.suffix == ".nix"]
+    if nix_indices:
+        n_enriched = _batch_lsp_enrich_nix(nix_indices, paths, per_file)
+        if n_enriched:
+            print(
+                f"  LSP enrichment: {n_enriched}/{len(nix_indices)} Nix files "
+                f"enriched via nil",
+                file=sys.stderr,
+                flush=True,
+            )
 
     all_nodes: list[dict] = []
     all_edges: list[dict] = []

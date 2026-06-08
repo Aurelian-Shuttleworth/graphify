@@ -1,13 +1,24 @@
 import subprocess
 import json
 import logging
+import shutil
 import threading
 import time
 
 logger = logging.getLogger(__name__)
 
 class LspClient:
-    """A lightweight, zero-dependency JSON-RPC client for interacting with Language Servers via stdio."""
+    """A lightweight, zero-dependency JSON-RPC client for interacting with Language Servers via stdio.
+    
+    Supports context manager usage for shared sessions::
+
+        with LspClient("nil") as client:
+            client.initialize(root_uri)
+            for path in nix_files:
+                client.did_open(uri, text)
+                symbols = client.document_symbol(uri)
+                client.did_close(uri)
+    """
     
     def __init__(self, binary="nil"):
         self.binary = binary
@@ -16,8 +27,17 @@ class LspClient:
         self._responses = {}
         self._read_thread = None
         self._running = False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
         
     def start(self):
+        if not shutil.which(self.binary):
+            raise RuntimeError(f"LSP binary '{self.binary}' not found on PATH.")
         try:
             self.process = subprocess.Popen(
                 [self.binary],
@@ -129,6 +149,12 @@ class LspClient:
             "textDocument": {"uri": uri}
         })
         return res.get("result", [])
+
+    def did_close(self, uri):
+        """Notify the server that a document was closed (frees server-side resources)."""
+        self.notify("textDocument/didClose", {
+            "textDocument": {"uri": uri}
+        })
         
     def stop(self):
         self._running = False

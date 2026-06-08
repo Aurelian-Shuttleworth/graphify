@@ -330,3 +330,80 @@ def test_nix_module_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids, f"dangling source in module: {e['source']}"
+
+
+# ── LSP Batch Enrichment ─────────────────────────────────────────────────────
+
+import shutil
+
+_needs_nil = pytest.mark.skipif(
+    not shutil.which("nil"),
+    reason="nil LSP server not available on PATH",
+)
+
+
+@_needs_nil
+@_needs_nix
+def test_nix_lsp_batch_enrichment_adds_snippets():
+    """Batch LSP enrichment adds snippet fields to tree-sitter nodes."""
+    from graphify.extract import _batch_lsp_enrich_nix
+    extract_nix = _import_extract_nix()
+
+    path = FIXTURES / "sample.nix"
+    result = extract_nix(path)
+
+    per_file = [result]
+    n = _batch_lsp_enrich_nix([0], [path], per_file)
+
+    assert n == 1, "expected 1 file to be enriched"
+    snippets = [n for n in result["nodes"] if n.get("snippet")]
+    assert len(snippets) > 0, "no snippets found after LSP enrichment"
+
+
+@_needs_nil
+@_needs_nix
+def test_nix_lsp_enrichment_preserves_edges():
+    """LSP enrichment must not lose tree-sitter semantic edges or raw_calls."""
+    from graphify.extract import _batch_lsp_enrich_nix
+    extract_nix = _import_extract_nix()
+
+    path = FIXTURES / "sample_module.nix"
+    result = extract_nix(path)
+
+    edge_count_before = len(result["edges"])
+    relations_before = {e["relation"] for e in result["edges"]}
+
+    per_file = [result]
+    _batch_lsp_enrich_nix([0], [path], per_file)
+
+    assert len(result["edges"]) == edge_count_before, \
+        f"edge count changed: {edge_count_before} -> {len(result['edges'])}"
+    assert relations_before == {e["relation"] for e in result["edges"]}, \
+        "edge relation types changed after LSP enrichment"
+    assert "raw_calls" in result, "raw_calls key lost after LSP enrichment"
+
+
+@_needs_nil
+@_needs_nix
+def test_nix_lsp_shared_session_multiple_files():
+    """Shared session handles multiple files on one nil connection."""
+    from graphify.extract import _batch_lsp_enrich_nix
+    extract_nix = _import_extract_nix()
+
+    paths = [FIXTURES / "sample.nix", FIXTURES / "sample_module.nix"]
+    results = [extract_nix(p) for p in paths]
+
+    n = _batch_lsp_enrich_nix([0, 1], paths, results)
+    assert n == 2, f"expected 2 files enriched, got {n}"
+
+
+def test_nix_lsp_graceful_without_nil():
+    """_batch_lsp_enrich_nix returns 0 when nil is absent."""
+    from graphify.extract import _batch_lsp_enrich_nix
+    from unittest.mock import patch
+
+    with patch("shutil.which", return_value=None):
+        n = _batch_lsp_enrich_nix(
+            [0], [Path("fake.nix")], [{"nodes": [], "edges": []}]
+        )
+    assert n == 0, "should return 0 when nil is not available"
