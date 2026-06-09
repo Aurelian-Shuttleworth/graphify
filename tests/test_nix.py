@@ -363,23 +363,54 @@ def test_nix_lsp_batch_enrichment_adds_snippets():
 @_needs_nil
 @_needs_nix
 def test_nix_lsp_enrichment_preserves_edges():
-    """LSP enrichment must not lose tree-sitter semantic edges or raw_calls."""
+    """LSP enrichment must not lose tree-sitter semantic edges or raw_calls.
+
+    It IS expected to add new ``contains`` edges from the LSP hierarchy,
+    connecting LSP-only nodes to their parents.
+    """
     from graphify.extract import _batch_lsp_enrich_nix
     extract_nix = _import_extract_nix()
 
     path = FIXTURES / "sample_module.nix"
     result = extract_nix(path)
 
-    edge_count_before = len(result["edges"])
-    relations_before = {e["relation"] for e in result["edges"]}
+    edges_before = list(result["edges"])
+    edge_count_before = len(edges_before)
+    relations_before = {e["relation"] for e in edges_before}
+    edge_triples_before = {
+        (e["source"], e["target"], e["relation"]) for e in edges_before
+    }
 
     per_file = [result]
     _batch_lsp_enrich_nix([0], [path], per_file)
 
-    assert len(result["edges"]) == edge_count_before, \
-        f"edge count changed: {edge_count_before} -> {len(result['edges'])}"
-    assert relations_before == {e["relation"] for e in result["edges"]}, \
-        "edge relation types changed after LSP enrichment"
+    # No existing edge should be removed.
+    edge_triples_after = {
+        (e["source"], e["target"], e["relation"]) for e in result["edges"]
+    }
+    lost = edge_triples_before - edge_triples_after
+    assert not lost, f"edges lost after LSP enrichment: {lost}"
+
+    # Edge count should be >= before (LSP adds contains edges).
+    assert len(result["edges"]) >= edge_count_before, \
+        f"edge count decreased: {edge_count_before} -> {len(result['edges'])}"
+
+    # All original relation types should still be present.
+    assert relations_before <= {e["relation"] for e in result["edges"]}, \
+        "edge relation types lost after LSP enrichment"
+
+    # New edges should be valid contains edges with correct direction.
+    new_edges = [
+        e for e in result["edges"]
+        if (e["source"], e["target"], e["relation"]) not in edge_triples_before
+    ]
+    for e in new_edges:
+        assert e["relation"] == "contains", \
+            f"unexpected new edge relation: {e['relation']}"
+        # Parent→child: target ID should be longer or more specific
+        assert not e["source"].startswith(e["target"]), \
+            f"reversed contains edge: {e['source']} -> {e['target']}"
+
     assert "raw_calls" in result, "raw_calls key lost after LSP enrichment"
 
 
@@ -407,3 +438,178 @@ def test_nix_lsp_graceful_without_nil():
             [0], [Path("fake.nix")], [{"nodes": [], "edges": []}]
         )
     assert n == 0, "should return 0 when nil is not available"
+
+
+# ── Edge normalization tests ──────────────────────────────────────────────
+
+
+def test_normalize_edges_lowercases_relation():
+    """_normalize_edges should lowercase all relation strings."""
+    from graphify.extract import _normalize_edges
+
+    edges = [
+        {"source": "a", "target": "b", "relation": "CONTAINS"},
+        {"source": "c", "target": "d", "relation": "References"},
+        {"source": "e", "target": "f", "relation": "contains"},
+    ]
+    _normalize_edges(edges)
+    assert edges[0]["relation"] == "contains"
+    assert edges[1]["relation"] == "references"
+    assert edges[2]["relation"] == "contains"
+
+
+def test_normalize_edges_flips_reversed_contains():
+    """Reversed contains edges (child→parent) should be flipped."""
+    from graphify.extract import _normalize_edges
+
+    edges = [
+        # child→parent: source ID starts with target ID
+        {"source": "mod_options_programs", "target": "mod_options", "relation": "CONTAINS"},
+        {"source": "mod_options", "target": "mod", "relation": "contains"},
+    ]
+    _normalize_edges(edges)
+
+    # Both should now be parent→child
+    assert edges[0]["source"] == "mod_options"
+    assert edges[0]["target"] == "mod_options_programs"
+    assert edges[1]["source"] == "mod"
+    assert edges[1]["target"] == "mod_options"
+
+
+def test_normalize_edges_preserves_correct_direction():
+    """Correctly directed contains edges should not be flipped."""
+    from graphify.extract import _normalize_edges
+
+    edges = [
+        {"source": "file_nid", "target": "file_nid_module", "relation": "contains"},
+        {"source": "mod", "target": "mod_cfg", "relation": "contains"},
+    ]
+    _normalize_edges(edges)
+
+    assert edges[0]["source"] == "file_nid"
+    assert edges[0]["target"] == "file_nid_module"
+    assert edges[1]["source"] == "mod"
+    assert edges[1]["target"] == "mod_cfg"
+
+
+# ── LSP hierarchy edge tests ─────────────────────────────────────────────
+
+
+@_needs_nil
+@_needs_nix
+def test_lsp_symbols_returns_edges():
+    """_lsp_symbols_for_file should return both nodes and edges."""
+    from graphify.extract import _lsp_symbols_for_file
+    from graphify.lsp_client import LspClient
+
+    path = FIXTURES / "sample.nix"
+    source = path.read_text()
+
+    with LspClient("nil") as client:
+        client.initialize(f"file://{path.parent.absolute()}")
+        result = _lsp_symbols_for_file(client, path, source)
+
+    assert "nodes" in result, "missing 'nodes' key"
+    assert "edges" in result, "missing 'edges' key"
+    assert isinstance(result["nodes"], dict)
+    assert isinstance(result["edges"], list)
+    assert len(result["nodes"]) > 0, "expected at least one node"
+    assert len(result["edges"]) > 0, "expected at least one edge"
+
+
+@_needs_nil
+@_needs_nix
+def test_lsp_edges_are_parent_to_child():
+    """All LSP contains edges should be parent→child (not reversed)."""
+    from graphify.extract import _lsp_symbols_for_file
+    from graphify.lsp_client import LspClient
+
+    path = FIXTURES / "sample_module.nix"
+    source = path.read_text()
+
+    with LspClient("nil") as client:
+        client.initialize(f"file://{path.parent.absolute()}")
+        result = _lsp_symbols_for_file(client, path, source)
+
+    for edge in result["edges"]:
+        assert edge["relation"] == "contains"
+        # source should NOT start with target (that would be child→parent)
+        assert not edge["source"].startswith(edge["target"]), \
+            f"reversed: {edge['source']} -> {edge['target']}"
+
+
+@_needs_nil
+@_needs_nix
+def test_lsp_root_symbols_connect_to_file_node():
+    """Top-level LSP symbols should have contains edges from the file node."""
+    from graphify.extract import _lsp_symbols_for_file, _make_id
+    from graphify.lsp_client import LspClient
+
+    path = FIXTURES / "sample.nix"
+    source = path.read_text()
+    file_nid = _make_id(str(path))
+
+    with LspClient("nil") as client:
+        client.initialize(f"file://{path.parent.absolute()}")
+        result = _lsp_symbols_for_file(client, path, source)
+
+    # At least one edge should originate from the file node
+    file_edges = [e for e in result["edges"] if e["source"] == file_nid]
+    assert len(file_edges) > 0, \
+        f"no edges from file node {file_nid}"
+
+
+@_needs_nil
+@_needs_nix
+def test_lsp_edges_deduplicated_during_merge():
+    """Edge dedup should prevent the LSP merge from adding duplicate triples.
+
+    Note: the tree-sitter Nix extractor already produces some duplicate
+    edges (a known pre-existing issue).  This test checks that the LSP
+    merge layer does not make it *worse*.
+    """
+    from graphify.extract import _batch_lsp_enrich_nix
+    extract_nix = _import_extract_nix()
+
+    path = FIXTURES / "sample_module.nix"
+    result = extract_nix(path)
+
+    # Count pre-existing duplicates from tree-sitter
+    triples_before = [
+        (e["source"], e["target"], e["relation"]) for e in result["edges"]
+    ]
+    dupes_before = len(triples_before) - len(set(triples_before))
+
+    per_file = [result]
+    _batch_lsp_enrich_nix([0], [path], per_file)
+
+    # After LSP merge, duplicates should not increase
+    triples_after = [
+        (e["source"], e["target"], e["relation"]) for e in result["edges"]
+    ]
+    dupes_after = len(triples_after) - len(set(triples_after))
+
+    assert dupes_after <= dupes_before, \
+        f"LSP merge added duplicates: {dupes_before} -> {dupes_after}"
+
+
+@_needs_nil
+@_needs_nix
+def test_snippet_cap():
+    """Snippets from LSP should not exceed _MAX_SNIPPET_LINES."""
+    from graphify.extract import _lsp_symbols_for_file, _MAX_SNIPPET_LINES
+    from graphify.lsp_client import LspClient
+
+    path = FIXTURES / "sample_module.nix"
+    source = path.read_text()
+
+    with LspClient("nil") as client:
+        client.initialize(f"file://{path.parent.absolute()}")
+        result = _lsp_symbols_for_file(client, path, source)
+
+    for nid, node in result["nodes"].items():
+        snippet = node.get("snippet", "")
+        line_count = len(snippet.split("\n"))
+        # +1 for the truncation marker line
+        assert line_count <= _MAX_SNIPPET_LINES + 1, \
+            f"snippet for {nid} has {line_count} lines (max {_MAX_SNIPPET_LINES})"

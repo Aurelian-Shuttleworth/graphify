@@ -10629,6 +10629,9 @@ def _resolve_nix_import(path_text: str, source_file: Path) -> Path | None:
     return resolved
 
 
+_MAX_SNIPPET_LINES = 50
+
+
 def extract_nix(path: Path) -> dict:
     """Extract semantic nodes and edges from a .nix file via tree-sitter.
 
@@ -10646,25 +10649,35 @@ def _lsp_symbols_for_file(
 ) -> dict:
     """Get LSP document symbols for a single file using an existing client session.
 
-    Returns ``{node_id: {"label": str, "snippet": str, "source_location": str}}``
-    or ``{}`` on any error.  The caller is responsible for calling
-    ``client.did_close()`` afterwards.
+    Returns ``{"nodes": {node_id: {...}}, "edges": [{source, target, ...}]}``.
+    Generates ``contains`` edges from the LSP hierarchy so that LSP-only
+    nodes are connected to their parents rather than floating as isolates.
     """
     stem = _file_stem(path)
     uri = f"file://{path.absolute()}"
     lines = source_text.split("\n")
+    str_path = str(path)
+    file_nid = _make_id(str(path))
 
     client.did_open(uri, source_text)
     symbols = client.document_symbol(uri)
 
     lsp_nodes: dict[str, dict] = {}
+    lsp_edges: list[dict] = []
 
-    def process_symbol(sym, parent_path=""):
+    def process_symbol(sym, parent_path="", parent_nid=None):
         name = sym.get("name", "Unknown")
         full_name = f"{parent_path}.{name}" if parent_path else name
         start_line = sym.get("range", {}).get("start", {}).get("line", 0)
         end_line = sym.get("range", {}).get("end", {}).get("line", len(lines) - 1)
-        snippet = "\n".join(lines[start_line : end_line + 1])
+
+        # Cap snippet length to prevent top-level attrsets from embedding
+        # entire files.
+        snippet_lines = lines[start_line : end_line + 1]
+        if len(snippet_lines) > _MAX_SNIPPET_LINES:
+            snippet_lines = snippet_lines[:_MAX_SNIPPET_LINES] + ["# ... truncated"]
+        snippet = "\n".join(snippet_lines)
+
         nid = _make_id(stem, full_name)
 
         lsp_nodes[nid] = {
@@ -10673,14 +10686,49 @@ def _lsp_symbols_for_file(
             "source_location": f"L{start_line + 1}",
         }
 
+        # Generate parent→child contains edge.  Root symbols connect to
+        # the file node; nested symbols connect to their parent symbol.
+        effective_parent = parent_nid if parent_nid else file_nid
+        lsp_edges.append({
+            "source": effective_parent,
+            "target": nid,
+            "relation": "contains",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{start_line + 1}",
+            "weight": 1.0,
+        })
+
         for child in sym.get("children", []):
-            process_symbol(child, full_name)
+            process_symbol(child, full_name, parent_nid=nid)
 
     for sym in symbols:
         process_symbol(sym)
 
     client.did_close(uri)
-    return lsp_nodes
+    return {"nodes": lsp_nodes, "edges": lsp_edges}
+
+
+def _normalize_edges(edges: list[dict]) -> None:
+    """Normalize edge relations in-place.
+
+    1. Lowercase all relation strings (``CONTAINS`` → ``contains``).
+    2. Detect and flip reversed containment edges using the ID-prefix
+       heuristic: if ``source.startswith(target)`` on a ``contains``
+       edge the child is pointing to the parent — swap source/target.
+    """
+    for edge in edges:
+        rel = edge.get("relation", "")
+        # Step 1: case-normalize
+        if rel != rel.lower():
+            edge["relation"] = rel.lower()
+            rel = rel.lower()
+
+        # Step 2: flip reversed contains edges
+        if rel == "contains":
+            src, tgt = edge.get("source", ""), edge.get("target", "")
+            if src and tgt and src.startswith(tgt) and src != tgt:
+                edge["source"], edge["target"] = tgt, src
 
 
 def _batch_lsp_enrich_nix(
@@ -10729,9 +10777,12 @@ def _batch_lsp_enrich_nix(
 
                 try:
                     source_text = path.read_text(encoding="utf-8", errors="replace")
-                    lsp_nodes = _lsp_symbols_for_file(client, path, source_text)
+                    lsp_result = _lsp_symbols_for_file(client, path, source_text)
                 except Exception:
                     continue  # skip this file, keep tree-sitter result
+
+                lsp_nodes = lsp_result.get("nodes", {})
+                lsp_edges = lsp_result.get("edges", [])
 
                 if not lsp_nodes:
                     continue
@@ -10760,6 +10811,17 @@ def _batch_lsp_enrich_nix(
                                 "snippet": lsp_node.get("snippet", ""),
                             }
                         )
+
+                # Merge LSP edges with deduplication against existing edges.
+                existing_edge_triples = {
+                    (e["source"], e["target"], e["relation"])
+                    for e in result.get("edges", [])
+                }
+                for edge in lsp_edges:
+                    triple = (edge["source"], edge["target"], edge["relation"])
+                    if triple not in existing_edge_triples:
+                        result.setdefault("edges", []).append(edge)
+                        existing_edge_triples.add(triple)
 
                 enriched += 1
 
@@ -11509,6 +11571,11 @@ def extract(
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
+
+    # Normalize edge relations: lowercase + flip reversed contains edges.
+    # Catches stale cache entries from older extractors that used uppercase
+    # CONTAINS with child→parent direction.
+    _normalize_edges(all_edges)
 
     _augment_symbol_resolution_edges(paths, all_nodes, all_edges, root)
 
