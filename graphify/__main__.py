@@ -2245,7 +2245,7 @@ def main() -> None:
         if len(sys.argv) < 3:
             print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _query_graph_text
+        from graphify.serve import _query_graph
         from graphify.security import sanitize_label
         from networkx.readwrite import json_graph
 
@@ -2305,13 +2305,14 @@ def main() -> None:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
         print(
-            _query_graph_text(
+            _query_graph(
                 G,
                 question,
                 mode="dfs" if use_dfs else "bfs",
                 depth=2,
                 token_budget=budget,
                 context_filters=context_filters,
+                format="text",
             )
         )
     elif cmd == "affected":
