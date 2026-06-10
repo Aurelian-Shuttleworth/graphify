@@ -353,7 +353,7 @@ def test_nix_lsp_batch_enrichment_adds_snippets():
     result = extract_nix(path)
 
     per_file = [result]
-    n = _batch_lsp_enrich_nix([0], [path], per_file)
+    n, _resyncs = _batch_lsp_enrich_nix([0], [path], per_file)
 
     assert n == 1, "expected 1 file to be enriched"
     snippets = [n for n in result["nodes"] if n.get("snippet")]
@@ -424,7 +424,7 @@ def test_nix_lsp_shared_session_multiple_files():
     paths = [FIXTURES / "sample.nix", FIXTURES / "sample_module.nix"]
     results = [extract_nix(p) for p in paths]
 
-    n = _batch_lsp_enrich_nix([0, 1], paths, results)
+    n, _resyncs = _batch_lsp_enrich_nix([0, 1], paths, results)
     assert n == 2, f"expected 2 files enriched, got {n}"
 
 
@@ -434,7 +434,7 @@ def test_nix_lsp_graceful_without_nil():
     from unittest.mock import patch
 
     with patch("shutil.which", return_value=None):
-        n = _batch_lsp_enrich_nix(
+        n, _resyncs = _batch_lsp_enrich_nix(
             [0], [Path("fake.nix")], [{"nodes": [], "edges": []}]
         )
     assert n == 0, "should return 0 when nil is not available"

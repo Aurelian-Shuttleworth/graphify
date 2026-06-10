@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 try:
@@ -2749,84 +2750,92 @@ def main() -> None:
         )
         from graphify.report import generate
         from graphify.export import to_json, to_html
+        from graphify.watch import _rebuild_lock
 
-        print("Loading existing graph...")
-        _enforce_graph_size_cap_or_exit(graph_json)
-        _raw = json.loads(graph_json.read_text(encoding="utf-8"))
-        _directed = bool(_raw.get("directed", False))
-        G = build_from_json(_raw, directed=_directed)
-        print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-        print("Re-clustering...")
-        communities = cluster(G, resolution=co_resolution, exclude_hubs_percentile=co_exclude_hubs)
-        # Mirror the watch/update path (#822): map new cids to prior ones by
-        # node-overlap so the existing .graphify_labels.json keeps attaching
-        # to the same conceptual community after re-clustering. Without this,
-        # labels follow raw cid index and become misaligned whenever the
-        # graph has changed between labeling and cluster-only (#1027).
-        previous_node_community = {
-            n["id"]: n["community"]
-            for n in _raw.get("nodes", [])
-            if n.get("community") is not None and n.get("id") is not None
-        }
-        if previous_node_community:
-            communities = remap_communities_to_previous(communities, previous_node_community)
-        cohesion = score_all(G, communities)
-        gods = god_nodes(G)
-        surprises = surprising_connections(G, communities)
+        # Acquire the rebuild lock to prevent TOCTOU races with concurrent
+        # `graphify update` commands — without this, cluster-only can load
+        # a stale graph.json and overwrite the fresh one.
         out = watch_path / "graphify-out"
-        out.mkdir(parents=True, exist_ok=True)
-        labels_path = out / ".graphify_labels.json"
-        if labels_path.exists() and not force_relabel:
-            try:
-                labels = {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
-            except Exception:
-                labels = {cid: f"Community {cid}" for cid in communities}
-        elif no_label and not force_relabel:
-            labels = {cid: f"Community {cid}" for cid in communities}
-        else:
-            # No labels file yet (or `graphify label` forced a refresh). When run
-            # standalone there is no orchestrating agent to do skill.md Step 5, so
-            # auto-name communities with the configured backend rather than leave
-            # "Community N" (#1097). Degrades to placeholders if no backend/on error.
-            from graphify.llm import generate_community_labels
-            print("Labeling communities...")
-            # The final labels (LLM or placeholder fallback) are persisted to
-            # .graphify_labels.json by the unconditional write below.
-            labels, _ = generate_community_labels(
-                G, communities, backend=label_backend, gods=gods
-            )
-        questions = suggest_questions(G, communities, labels)
-        tokens = {"input": 0, "output": 0}
-        from graphify.export import _git_head as _gh
-        _commit = _gh()
-        report = generate(G, communities, cohesion, labels, gods, surprises,
-                          {"warning": "cluster-only mode — file stats not available"},
-                          tokens, str(watch_path), suggested_questions=questions,
-                          min_community_size=min_community_size, built_at_commit=_commit)
-        (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
-        from graphify.export import backup_if_protected as _backup
-        _backup(out)
-        to_json(G, communities, str(out / "graph.json"))
-        labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
+        with _rebuild_lock(out, blocking=True) as got:
+            if not got:
+                print("[graphify cluster-only] waiting for concurrent rebuild to finish...")
 
-        # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
-        # GRAPH_REPORT.md) always land. Honor --no-viz explicitly; otherwise
-        # fall back to ValueError handling so an oversized graph doesn't crash
-        # the CLI mid-write and leave a stale graph.html on disk.
-        html_target = out / "graph.html"
-        if no_viz:
-            if html_target.exists():
-                html_target.unlink()
-            print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated (--no-viz; graph.html removed).")
-        else:
-            try:
-                to_html(G, communities, str(html_target), community_labels=labels or None)
-                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
-            except ValueError as viz_err:
+            print("Loading existing graph...")
+            _enforce_graph_size_cap_or_exit(graph_json)
+            _raw = json.loads(graph_json.read_text(encoding="utf-8"))
+            _directed = bool(_raw.get("directed", False))
+            G = build_from_json(_raw, directed=_directed)
+            print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+            print("Re-clustering...")
+            communities = cluster(G, resolution=co_resolution, exclude_hubs_percentile=co_exclude_hubs)
+            # Mirror the watch/update path (#822): map new cids to prior ones by
+            # node-overlap so the existing .graphify_labels.json keeps attaching
+            # to the same conceptual community after re-clustering. Without this,
+            # labels follow raw cid index and become misaligned whenever the
+            # graph has changed between labeling and cluster-only (#1027).
+            previous_node_community = {
+                n["id"]: n["community"]
+                for n in _raw.get("nodes", [])
+                if n.get("community") is not None and n.get("id") is not None
+            }
+            if previous_node_community:
+                communities = remap_communities_to_previous(communities, previous_node_community)
+            cohesion = score_all(G, communities)
+            gods = god_nodes(G)
+            surprises = surprising_connections(G, communities)
+            out.mkdir(parents=True, exist_ok=True)
+            labels_path = out / ".graphify_labels.json"
+            if labels_path.exists() and not force_relabel:
+                try:
+                    labels = {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
+                except Exception:
+                    labels = {cid: f"Community {cid}" for cid in communities}
+            elif no_label and not force_relabel:
+                labels = {cid: f"Community {cid}" for cid in communities}
+            else:
+                # No labels file yet (or `graphify label` forced a refresh). When run
+                # standalone there is no orchestrating agent to do skill.md Step 5, so
+                # auto-name communities with the configured backend rather than leave
+                # "Community N" (#1097). Degrades to placeholders if no backend/on error.
+                from graphify.llm import generate_community_labels
+                print("Labeling communities...")
+                # The final labels (LLM or placeholder fallback) are persisted to
+                # .graphify_labels.json by the unconditional write below.
+                labels, _ = generate_community_labels(
+                    G, communities, backend=label_backend, gods=gods
+                )
+            questions = suggest_questions(G, communities, labels)
+            tokens = {"input": 0, "output": 0}
+            from graphify.export import _git_head as _gh
+            _commit = _gh()
+            report = generate(G, communities, cohesion, labels, gods, surprises,
+                              {"warning": "cluster-only mode — file stats not available"},
+                              tokens, str(watch_path), suggested_questions=questions,
+                              min_community_size=min_community_size, built_at_commit=_commit)
+            (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
+            from graphify.export import backup_if_protected as _backup
+            _backup(out)
+            to_json(G, communities, str(out / "graph.json"))
+            labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
+
+            # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
+            # GRAPH_REPORT.md) always land. Honor --no-viz explicitly; otherwise
+            # fall back to ValueError handling so an oversized graph doesn't crash
+            # the CLI mid-write and leave a stale graph.html on disk.
+            html_target = out / "graph.html"
+            if no_viz:
                 if html_target.exists():
                     html_target.unlink()
-                print(f"Skipped graph.html: {viz_err}")
-                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
+                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated (--no-viz; graph.html removed).")
+            else:
+                try:
+                    to_html(G, communities, str(html_target), community_labels=labels or None)
+                    print(f"Done - {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
+                except ValueError as viz_err:
+                    if html_target.exists():
+                        html_target.unlink()
+                    print(f"Skipped graph.html: {viz_err}")
+                    print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
 
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
@@ -3749,14 +3758,31 @@ def main() -> None:
                 # Also track per-chunk success so we can fail loudly when
                 # every chunk errors (e.g. missing backend SDK package).
                 _chunk_stats = {"total": 0, "succeeded": 0}
+                _first_chunk = threading.Event()
                 def _progress(idx: int, total: int, _result: dict) -> None:
                     _chunk_stats["total"] = total
                     _chunk_stats["succeeded"] += 1
+                    _first_chunk.set()
                     print(
                         f"[graphify extract] chunk {idx + 1}/{total} done",
                         flush=True,
                     )
                 corpus_kwargs["on_chunk_done"] = _progress
+
+                # Fire a warning after 30s if no chunk has completed — the LLM
+                # provider may be unreachable or hanging without surfacing an error.
+                def _timeout_warning() -> None:
+                    if not _first_chunk.is_set():
+                        print(
+                            f"[graphify extract] WARNING: no response from "
+                            f"'{backend}' after 30s. Check your API key and "
+                            f"network connectivity.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                _timer = threading.Timer(30.0, _timeout_warning)
+                _timer.daemon = True
+                _timer.start()
 
                 try:
                     fresh = _extract_corpus_parallel(
@@ -3772,6 +3798,8 @@ def main() -> None:
                         file=sys.stderr,
                     )
                     fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+                finally:
+                    _timer.cancel()
 
                 # on_chunk_done only fires after a chunk succeeds. If fresh
                 # semantic extraction was requested and no chunks completed,

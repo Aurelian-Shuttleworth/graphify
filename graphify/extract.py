@@ -10735,24 +10735,24 @@ def _batch_lsp_enrich_nix(
     nix_indices: list[int],
     paths: list[Path],
     per_file: list[dict],
-) -> int:
+) -> tuple[int, int]:
     """Enrich ``.nix`` extraction results with LSP data using a shared ``nil`` session.
 
     Opens a single ``nil`` process, iterates all ``.nix`` files, and merges
     hierarchical labels + snippets into the tree-sitter nodes.
 
-    Returns the number of files successfully enriched.
+    Returns ``(enriched_count, resync_count)``.
     """
     import shutil
     from .lsp_client import LspClient
 
     if not shutil.which("nil"):
-        return 0
+        return 0, 0
 
     # Determine workspace root (common ancestor of all .nix paths).
     nix_paths = [paths[i] for i in nix_indices]
     if not nix_paths:
-        return 0
+        return 0, 0
 
     if len(nix_paths) == 1:
         workspace_root = nix_paths[0].parent.absolute()
@@ -10767,6 +10767,7 @@ def _batch_lsp_enrich_nix(
         workspace_root = Path(*parts_lists[0][:common_len]) if common_len else Path("/")
 
     enriched = 0
+    resync_count = 0
     try:
         with LspClient("nil") as client:
             client.initialize(f"file://{workspace_root}")
@@ -10779,6 +10780,7 @@ def _batch_lsp_enrich_nix(
                     source_text = path.read_text(encoding="utf-8", errors="replace")
                     lsp_result = _lsp_symbols_for_file(client, path, source_text)
                 except Exception:
+                    logger.debug("LSP enrichment skipped for %s", path)
                     continue  # skip this file, keep tree-sitter result
 
                 lsp_nodes = lsp_result.get("nodes", {})
@@ -10825,6 +10827,8 @@ def _batch_lsp_enrich_nix(
 
                 enriched += 1
 
+            resync_count = client.resync_count
+
     except Exception as e:
         import logging
 
@@ -10832,7 +10836,7 @@ def _batch_lsp_enrich_nix(
             "LSP batch enrichment failed, keeping tree-sitter results: %s", e
         )
 
-    return enriched
+    return enriched, resync_count
 
 def _extract_nix_treesitter(path: Path) -> dict:
     """Extract functions, bindings, imports, and NixOS module patterns from a .nix file."""
@@ -11555,11 +11559,12 @@ def extract(
     # source snippets.  Entirely skipped when nil is not on PATH.
     nix_indices = [i for i, p in enumerate(paths) if p.suffix == ".nix"]
     if nix_indices:
-        n_enriched = _batch_lsp_enrich_nix(nix_indices, paths, per_file)
+        n_enriched, n_resyncs = _batch_lsp_enrich_nix(nix_indices, paths, per_file)
         if n_enriched:
+            suffix = f" ({n_resyncs} resyncs)" if n_resyncs else ""
             print(
                 f"  LSP enrichment: {n_enriched}/{len(nix_indices)} Nix files "
-                f"enriched via nil",
+                f"enriched via nil{suffix}",
                 file=sys.stderr,
                 flush=True,
             )

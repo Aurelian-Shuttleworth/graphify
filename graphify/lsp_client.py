@@ -27,6 +27,8 @@ class LspClient:
         self._responses = {}
         self._read_thread = None
         self._running = False
+        self.resync_count = 0
+        self._decode_errors = 0
 
     def __enter__(self):
         self.start()
@@ -53,37 +55,96 @@ class LspClient:
             raise RuntimeError(f"LSP binary '{self.binary}' not found on PATH.")
             
     def _read_loop(self):
+        """Read LSP JSON-RPC messages from stdout with defensive re-sync.
+
+        Uses a rolling buffer instead of trusting ``Content-Length`` byte
+        counts exactly.  If a message fails to decode, the reader scans
+        forward for the next ``Content-Length:`` header to re-align the
+        stream.  This handles CR/LF mismatches and interleaved server
+        diagnostics that would otherwise corrupt all subsequent reads.
+        """
+        buf = b""
+        HEADER_RE = b"Content-Length:"
+        stdout = self.process.stdout
+
         while self._running and self.process.poll() is None:
-            # Read headers
-            content_length = None
-            while True:
-                line = self.process.stdout.readline()
-                if not line:
-                    break
-                line = line.decode('utf-8').strip()
-                if line == "":
-                    # End of headers
-                    break
-                if line.lower().startswith("content-length:"):
-                    content_length = int(line.split(":")[1].strip())
-            
-            if content_length is None:
-                continue
-                
-            # Read body
-            body = self.process.stdout.read(content_length)
-            if not body:
-                continue
-                
+            # Non-blocking buffered read — read1 returns whatever is
+            # available (up to 8 KiB) without blocking for the full
+            # amount.  Falls back to read(1) for unbuffered streams.
             try:
-                response = json.loads(body.decode('utf-8'))
-                if "id" in response:
-                    self._responses[response["id"]] = response
-                elif "method" in response:
-                    # Ignore notifications from server for now
-                    pass
-            except json.JSONDecodeError:
-                logger.error("Failed to decode LSP response")
+                chunk = stdout.read1(8192)  # type: ignore[attr-defined]
+            except AttributeError:
+                chunk = stdout.read(1)
+            if not chunk:
+                break
+            buf += chunk
+
+            # Process all complete messages in the buffer.
+            while HEADER_RE in buf:
+                header_start = buf.index(HEADER_RE)
+
+                # ── Re-sync: discard bytes before the header ──
+                if header_start > 0:
+                    discarded = buf[:header_start]
+                    buf = buf[header_start:]
+                    self.resync_count += 1
+                    logger.warning(
+                        "LSP stream resync: discarded %d bytes, "
+                        "fragment: %.200s",
+                        len(discarded),
+                        discarded.decode("utf-8", errors="replace"),
+                    )
+
+                # ── Find the header/body separator ──
+                sep = b"\r\n\r\n"
+                sep_len = 4
+                header_end = buf.find(sep)
+                if header_end == -1:
+                    sep = b"\n\n"  # fallback for LF-only servers
+                    sep_len = 2
+                    header_end = buf.find(sep)
+                if header_end == -1:
+                    break  # incomplete header — wait for more data
+
+                # ── Parse Content-Length from the header block ──
+                header_block = buf[:header_end].decode("utf-8", errors="replace")
+                content_length = None
+                for line in header_block.split("\n"):
+                    line = line.strip()
+                    if line.lower().startswith("content-length:"):
+                        try:
+                            content_length = int(line.split(":", 1)[1].strip())
+                        except (ValueError, IndexError):
+                            pass
+
+                if content_length is None:
+                    # Malformed header block — skip past the separator.
+                    buf = buf[header_end + sep_len:]
+                    continue
+
+                body_start = header_end + sep_len
+                body_end = body_start + content_length
+
+                if len(buf) < body_end:
+                    break  # incomplete body — wait for more data
+
+                body = buf[body_start:body_end]
+                buf = buf[body_end:]
+
+                try:
+                    response = json.loads(body.decode("utf-8"))
+                    if "id" in response:
+                        self._responses[response["id"]] = response
+                    elif "method" in response:
+                        # Silently ignore server notifications.
+                        pass
+                except json.JSONDecodeError:
+                    self._decode_errors += 1
+                    logger.warning(
+                        "Failed to decode LSP response (%d bytes): %.200s",
+                        len(body),
+                        body.decode("utf-8", errors="replace"),
+                    )
                 
     def _send(self, message):
         body = json.dumps(message).encode('utf-8')
