@@ -336,10 +336,13 @@ def test_nix_module_no_dangling_edges():
 
 import shutil
 
-_needs_nil = pytest.mark.skipif(
-    not shutil.which("nil"),
-    reason="nil LSP server not available on PATH",
+_needs_nix_lsp = pytest.mark.skipif(
+    not (shutil.which("nixd") or shutil.which("nil")),
+    reason="no Nix LSP server (nixd or nil) available on PATH",
 )
+
+# Keep legacy alias for readability in existing tests
+_needs_nil = _needs_nix_lsp
 
 
 @_needs_nil
@@ -428,8 +431,8 @@ def test_nix_lsp_shared_session_multiple_files():
     assert n == 2, f"expected 2 files enriched, got {n}"
 
 
-def test_nix_lsp_graceful_without_nil():
-    """_batch_lsp_enrich_nix returns 0 when nil is absent."""
+def test_nix_lsp_graceful_without_lsp():
+    """_batch_lsp_enrich_nix returns 0 when no Nix LSP is available."""
     from graphify.extract import _batch_lsp_enrich_nix
     from unittest.mock import patch
 
@@ -437,7 +440,7 @@ def test_nix_lsp_graceful_without_nil():
         n, _resyncs = _batch_lsp_enrich_nix(
             [0], [Path("fake.nix")], [{"nodes": [], "edges": []}]
         )
-    assert n == 0, "should return 0 when nil is not available"
+    assert n == 0, "should return 0 when no Nix LSP is available"
 
 
 # ── Edge normalization tests ──────────────────────────────────────────────
@@ -613,3 +616,173 @@ def test_snippet_cap():
         # +1 for the truncation marker line
         assert line_count <= _MAX_SNIPPET_LINES + 1, \
             f"snippet for {nid} has {line_count} lines (max {_MAX_SNIPPET_LINES})"
+
+
+# ── Fixture Flake Tests ──────────────────────────────────────────────────────
+
+FIXTURE_FLAKE = FIXTURES / "nix-flake"
+
+
+@_needs_nix
+class TestFixtureFlake:
+    """Validate extraction of the synthetic test fixture flake."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _extract_all(self, request):
+        extract_nix = _import_extract_nix()
+        nix_files = sorted(FIXTURE_FLAKE.rglob("*.nix"))
+        results = {}
+        errors = []
+        for f in nix_files:
+            r = extract_nix(f)
+            results[f] = r
+            if "error" in r:
+                errors.append((f, r["error"]))
+        request.cls.results = results
+        request.cls.errors = errors
+        request.cls.nix_files = nix_files
+
+    def test_all_files_extracted(self):
+        assert len(self.results) >= 9
+
+    def test_no_extraction_errors(self):
+        assert len(self.errors) == 0, \
+            f"{len(self.errors)} errors:\n" + \
+            "\n".join(f"  {p.name}: {e}" for p, e in self.errors)
+
+    def test_constants_not_module(self):
+        r = self.results[FIXTURE_FLAKE / "constants.nix"]
+        labels = _labels(r)
+        assert not any(l.endswith(" module") for l in labels)
+
+    def test_modules_detected_as_modules(self):
+        module_files = [
+            "modules/default.nix",
+            "modules/services/example.nix",
+            "modules/programs/editor.nix",
+            "home-manager/default.nix",
+        ]
+        for rel_path in module_files:
+            path = FIXTURE_FLAKE / rel_path
+            if path not in self.results:
+                continue
+            r = self.results[path]
+            labels = _labels(r)
+            assert any(l.endswith(" module") for l in labels), \
+                f"{rel_path} should be a module, got: {labels}"
+
+    def test_flake_nix_not_module(self):
+        r = self.results[FIXTURE_FLAKE / "flake.nix"]
+        labels = _labels(r)
+        assert not any(l.endswith(" module") for l in labels)
+
+    def test_modules_default_has_import_edges(self):
+        r = self.results[FIXTURE_FLAKE / "modules" / "default.nix"]
+        imports = _edges_with_relation(r, "imports_from")
+        assert len(imports) >= 2
+
+    def test_services_example_has_mkif_guard(self):
+        r = self.results[FIXTURE_FLAKE / "modules" / "services" / "example.nix"]
+        assert "guarded_by" in _relations(r)
+
+    def test_services_example_has_config_refs(self):
+        r = self.results[FIXTURE_FLAKE / "modules" / "services" / "example.nix"]
+        config_refs = [e for e in r["edges"] if e.get("context") == "config_ref"]
+        assert len(config_refs) >= 1
+
+    def test_services_example_finds_options(self):
+        r = self.results[FIXTURE_FLAKE / "modules" / "services" / "example.nix"]
+        labels = _labels(r)
+        option_labels = [l for l in labels if "options." in l or "enable" in l]
+        assert len(option_labels) >= 1
+
+    def test_services_example_has_cfg_binding(self):
+        r = self.results[FIXTURE_FLAKE / "modules" / "services" / "example.nix"]
+        labels = _labels(r)
+        assert any(l == "cfg" for l in labels)
+
+    def test_pkgs_tool_has_import(self):
+        r = self.results[FIXTURE_FLAKE / "pkgs" / "tool" / "default.nix"]
+        imports = _edges_with_relation(r, "imports_from")
+        assert len(imports) >= 1
+
+    def test_pkgs_lib_has_let_bindings(self):
+        r = self.results[FIXTURE_FLAKE / "pkgs" / "lib.nix"]
+        labels = _labels(r)
+        assert any("mkHelper" in l for l in labels)
+
+    def test_home_manager_has_imports(self):
+        r = self.results[FIXTURE_FLAKE / "home-manager" / "default.nix"]
+        imports = _edges_with_relation(r, "imports_from")
+        assert len(imports) >= 2
+
+    def test_overlay_is_not_module(self):
+        r = self.results[FIXTURE_FLAKE / "overlays" / "default.nix"]
+        labels = _labels(r)
+        assert not any(l.endswith(" module") for l in labels)
+
+    def test_no_dangling_edges_anywhere(self):
+        dangling = []
+        for path, r in self.results.items():
+            ids = {n["id"] for n in r["nodes"]}
+            for e in r["edges"]:
+                if e["source"] not in ids:
+                    dangling.append((path.name, e["source"], e["relation"]))
+        assert len(dangling) == 0, \
+            f"{len(dangling)} dangling edges:\n" + \
+            "\n".join(f"  {f}: {s} ({r})" for f, s, r in dangling[:10])
+
+    def test_node_field_completeness(self):
+        required = {"id", "label", "file_type", "source_file", "source_location"}
+        incomplete = []
+        for path, r in self.results.items():
+            for n in r["nodes"]:
+                missing = required - set(n.keys())
+                if missing:
+                    incomplete.append((path.name, n.get("id", "?"), missing))
+        assert len(incomplete) == 0
+
+    def test_edge_field_completeness(self):
+        required = {"source", "target", "relation", "confidence",
+                     "source_file", "source_location", "weight"}
+        incomplete = []
+        for path, r in self.results.items():
+            for e in r["edges"]:
+                missing = required - set(e.keys())
+                if missing:
+                    incomplete.append((path.name, e.get("relation", "?"), missing))
+        assert len(incomplete) == 0
+
+    def test_total_node_count(self):
+        total = sum(len(r["nodes"]) for r in self.results.values())
+        assert total >= 50, f"expected >= 50 nodes, got {total}"
+
+    def test_total_edge_count(self):
+        total = sum(len(r["edges"]) for r in self.results.values())
+        assert total >= 30, f"expected >= 30 edges, got {total}"
+
+    def test_relation_diversity(self):
+        all_rels: set[str] = set()
+        for r in self.results.values():
+            all_rels |= _relations(r)
+        assert "contains" in all_rels
+        assert "imports_from" in all_rels
+
+    def test_print_summary(self, capsys):
+        total_nodes = sum(len(r["nodes"]) for r in self.results.values())
+        total_edges = sum(len(r["edges"]) for r in self.results.values())
+        from collections import Counter
+        all_rels: Counter[str] = Counter()
+        module_count = 0
+        for r in self.results.values():
+            for e in r["edges"]:
+                all_rels[e["relation"]] += 1
+            if any(l.endswith(" module") for l in _labels(r)):
+                module_count += 1
+        print("\n" + "=" * 60)
+        print("FIXTURE FLAKE EXTRACTION SUMMARY")
+        print("=" * 60)
+        print(f"Files: {len(self.results)} | Modules: {module_count} | Errors: {len(self.errors)}")
+        print(f"Nodes: {total_nodes} | Edges: {total_edges}")
+        print(f"Relations: {dict(all_rels)}")
+        print("=" * 60)

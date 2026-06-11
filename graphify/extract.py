@@ -10736,18 +10736,26 @@ def _batch_lsp_enrich_nix(
     paths: list[Path],
     per_file: list[dict],
 ) -> tuple[int, int]:
-    """Enrich ``.nix`` extraction results with LSP data using a shared ``nil`` session.
+    """Enrich ``.nix`` extraction results with LSP data using a shared session.
 
-    Opens a single ``nil`` process, iterates all ``.nix`` files, and merges
-    hierarchical labels + snippets into the tree-sitter nodes.
+    Prefers ``nixd`` when available on PATH (better evaluation support),
+    falls back to ``nil``.  Opens a single LSP process, iterates all
+    ``.nix`` files, and merges hierarchical labels + snippets into the
+    tree-sitter nodes.
 
     Returns ``(enriched_count, resync_count)``.
     """
     import shutil
+    import logging
     from .lsp_client import LspClient
 
-    if not shutil.which("nil"):
+    logger = logging.getLogger(__name__)
+
+    nix_lsp = shutil.which("nixd") or shutil.which("nil")
+    if not nix_lsp:
         return 0, 0
+
+    logger.info("Nix LSP enrichment: using %s", nix_lsp)
 
     # Determine workspace root (common ancestor of all .nix paths).
     nix_paths = [paths[i] for i in nix_indices]
@@ -10769,7 +10777,7 @@ def _batch_lsp_enrich_nix(
     enriched = 0
     resync_count = 0
     try:
-        with LspClient("nil") as client:
+        with LspClient(nix_lsp) as client:
             client.initialize(f"file://{workspace_root}")
 
             for idx in nix_indices:

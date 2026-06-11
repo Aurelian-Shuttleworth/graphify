@@ -88,7 +88,7 @@ class LspClient:
                     discarded = buf[:header_start]
                     buf = buf[header_start:]
                     self.resync_count += 1
-                    logger.warning(
+                    logger.debug(
                         "LSP stream resync: discarded %d bytes, "
                         "fragment: %.200s",
                         len(discarded),
@@ -140,10 +140,9 @@ class LspClient:
                         pass
                 except json.JSONDecodeError:
                     self._decode_errors += 1
-                    logger.warning(
-                        "Failed to decode LSP response (%d bytes): %.200s",
+                    logger.debug(
+                        "LSP stream: skipped non-JSON body (%d bytes), resync will recover",
                         len(body),
-                        body.decode("utf-8", errors="replace"),
                     )
                 
     def _send(self, message):
@@ -216,6 +215,51 @@ class LspClient:
         self.notify("textDocument/didClose", {
             "textDocument": {"uri": uri}
         })
+
+    def references(self, uri, line, character, include_declaration=False):
+        """Find all references to the symbol at the given position.
+
+        Returns a list of ``Location`` objects or ``[]`` on timeout/error.
+        """
+        try:
+            res = self.request("textDocument/references", {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": include_declaration},
+            })
+            return res.get("result") or []
+        except TimeoutError:
+            return []
+
+    def definition(self, uri, line, character):
+        """Go to definition of the symbol at the given position.
+
+        Returns a flat list of ``{"uri": str, "range": {...}}`` dicts,
+        normalising both ``Location`` and ``LocationLink`` responses.
+        """
+        try:
+            res = self.request("textDocument/definition", {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+            })
+            result = res.get("result")
+            if result is None:
+                return []
+            # Normalise: could be Location, Location[], or LocationLink[]
+            if isinstance(result, dict):
+                result = [result]
+            locations = []
+            for item in result:
+                if "targetUri" in item:  # LocationLink
+                    locations.append({
+                        "uri": item["targetUri"],
+                        "range": item.get("targetRange", item.get("targetSelectionRange", {})),
+                    })
+                elif "uri" in item:  # Location
+                    locations.append({"uri": item["uri"], "range": item.get("range", {})})
+            return locations
+        except TimeoutError:
+            return []
         
     def stop(self):
         self._running = False
