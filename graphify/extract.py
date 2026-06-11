@@ -10850,19 +10850,49 @@ def _batch_lsp_enrich_nix(
 
     enriched = 0
     resync_count = 0
+    total_nix = len(nix_indices)
+    lsp_backend = Path(nix_lsp).name
     try:
         with LspClient(nix_lsp) as client:
             client.initialize(f"file://{workspace_root}")
 
-            for idx in nix_indices:
+            for file_pos, idx in enumerate(nix_indices, 1):
+                if file_pos == 1 or file_pos % 20 == 0 or file_pos == total_nix:
+                    print(
+                        f"  LSP enrichment: {file_pos}/{total_nix} files"
+                        f" ({file_pos * 100 // total_nix}%) via {lsp_backend}",
+                        flush=True,
+                    )
                 path = paths[idx]
                 result = per_file[idx]
 
                 try:
-                    source_text = path.read_text(encoding="utf-8", errors="replace")
-                    lsp_result = _lsp_symbols_for_file(client, path, source_text)
-                except Exception:
-                    logger.debug("LSP enrichment skipped for %s", path)
+                    import signal
+
+                    _LSP_FILE_TIMEOUT = 15  # seconds per file
+
+                    def _timeout_handler(signum, frame):
+                        raise TimeoutError(f"LSP timed out on {path.name}")
+
+                    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+                    signal.alarm(_LSP_FILE_TIMEOUT)
+                    try:
+                        source_text = path.read_text(encoding="utf-8", errors="replace")
+                        lsp_result = _lsp_symbols_for_file(client, path, source_text)
+                    finally:
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_handler)
+                except (Exception, TimeoutError) as exc:
+                    # Show relative path so users can distinguish multiple default.nix files
+                    try:
+                        rel_path = path.relative_to(workspace_root)
+                    except ValueError:
+                        rel_path = path.name
+                    logger.debug("LSP enrichment skipped for %s: %s", path, exc)
+                    print(
+                        f"  LSP enrichment: skipped {rel_path} ({type(exc).__name__})",
+                        flush=True,
+                    )
                     continue  # skip this file, keep tree-sitter result
 
                 lsp_nodes = lsp_result.get("nodes", {})
@@ -10909,6 +10939,11 @@ def _batch_lsp_enrich_nix(
 
                 enriched += 1
 
+            print(
+                f"  LSP enrichment: {total_nix}/{total_nix} files"
+                f" — {enriched} enriched via {lsp_backend}",
+                flush=True,
+            )
             resync_count = client.resync_count
 
             # --- Pass 2: Cross-file references + callPackage produces ---
@@ -10927,9 +10962,22 @@ def _batch_lsp_enrich_nix(
             _MAX_XREF_QUERIES = 100
             queries_made = 0
 
-            for idx in nix_indices:
+            print(
+                f"  Cross-file resolution: querying up to {_MAX_XREF_QUERIES}"
+                f" symbols across {total_nix} files...",
+                flush=True,
+            )
+
+            for xref_file_pos, idx in enumerate(nix_indices, 1):
                 if queries_made >= _MAX_XREF_QUERIES:
                     break
+                if xref_file_pos == 1 or xref_file_pos % 20 == 0:
+                    print(
+                        f"  Cross-file resolution: file {xref_file_pos}/{total_nix}"
+                        f" ({queries_made} queries, {xref_edges_added} xref"
+                        f" + {produces_edges_added} produces edges)",
+                        flush=True,
+                    )
                 path = paths[idx]
                 result = per_file[idx]
                 abs_path = path.absolute()
@@ -11050,6 +11098,11 @@ def _batch_lsp_enrich_nix(
                 except Exception:
                     pass
 
+            print(
+                f"  Cross-file resolution: done — {xref_edges_added} xref"
+                f" + {produces_edges_added} produces edges ({queries_made} queries)",
+                flush=True,
+            )
             if xref_edges_added or produces_edges_added:
                 logger.info(
                     "Cross-file resolution: %d xref edges, %d produces edges (%d queries)",
