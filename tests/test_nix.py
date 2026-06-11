@@ -786,3 +786,148 @@ class TestFixtureFlake:
         print(f"Nodes: {total_nodes} | Edges: {total_edges}")
         print(f"Relations: {dict(all_rels)}")
         print("=" * 60)
+
+
+# ── Flake Lock Parser Tests ──────────────────────────────────────────────────
+
+class TestFlakeLockParsing:
+    """Validate _extract_flake_lock() on the fixture flake.lock."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _parse_lock(self, request):
+        from graphify.extract import _extract_flake_lock
+        lock_path = FIXTURE_FLAKE / "flake.lock"
+        request.cls.result = _extract_flake_lock(lock_path)
+
+    def test_flake_lock_produces_depends_on_edges(self):
+        depends_on = [e for e in self.result["edges"] if e["relation"] == "depends_on"]
+        # 3 inputs: nixpkgs, home-manager, flake-parts
+        assert len(depends_on) == 3
+
+    def test_depends_on_has_flake_input_context(self):
+        for e in self.result["edges"]:
+            if e["relation"] == "depends_on":
+                assert e.get("context") == "flake_input", \
+                    f"depends_on edge missing flake_input context: {e}"
+
+    def test_synthetic_nodes_have_github_labels(self):
+        labels = [n["label"] for n in self.result["nodes"]]
+        github_labels = [l for l in labels if l.startswith("github:")]
+        assert len(github_labels) == 3
+        # Verify owner/repo format
+        for label in github_labels:
+            parts = label.split(":")
+            assert "/" in parts[1], f"expected owner/repo in {label}"
+
+    def test_root_node_skipped(self):
+        ids = [n["id"] for n in self.result["nodes"]]
+        # "root" should not appear as a node
+        for nid in ids:
+            assert "root" not in nid.split("_"), \
+                f"root entry should not produce a node: {nid}"
+
+    def test_synthetic_nodes_have_dependency_file_type(self):
+        for n in self.result["nodes"]:
+            assert n["file_type"] == "dependency", \
+                f"flake input node should have file_type=dependency: {n}"
+
+    def test_edges_point_from_flake_nix(self):
+        """All depends_on edges should source from the flake.nix file node."""
+        from graphify.extract import _make_id
+        flake_nix = FIXTURE_FLAKE / "flake.nix"
+        expected_source = _make_id(str(flake_nix))
+        for e in self.result["edges"]:
+            assert e["source"] == expected_source, \
+                f"depends_on edge should source from flake.nix: {e}"
+
+    def test_edge_field_completeness(self):
+        required = {"source", "target", "relation", "confidence",
+                     "source_file", "source_location", "weight"}
+        for e in self.result["edges"]:
+            missing = required - set(e.keys())
+            assert not missing, f"edge missing fields {missing}: {e}"
+
+    def test_node_field_completeness(self):
+        required = {"id", "label", "file_type", "source_file", "source_location"}
+        for n in self.result["nodes"]:
+            missing = required - set(n.keys())
+            assert not missing, f"node missing fields {missing}: {n}"
+
+
+# ── Option Type Extraction Tests ─────────────────────────────────────────────
+
+@_needs_nix
+class TestOptionTypeExtraction:
+    """Validate typed_as edges from mkOption type annotations."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _extract_modules(self, request):
+        extract_nix = _import_extract_nix()
+        request.cls.services = extract_nix(
+            FIXTURE_FLAKE / "modules" / "services" / "example.nix"
+        )
+        request.cls.editor = extract_nix(
+            FIXTURE_FLAKE / "modules" / "programs" / "editor.nix"
+        )
+
+    def _typed_as_edges(self, result):
+        return [e for e in result["edges"] if e["relation"] == "typed_as"]
+
+    def test_simple_type_produces_typed_as_edge(self):
+        """type = types.package → typed_as edge."""
+        typed = self._typed_as_edges(self.services)
+        contexts = [e.get("context", "") for e in typed]
+        assert any("types.package" in c for c in contexts), \
+            f"expected types.package in typed_as contexts: {contexts}"
+
+    def test_compound_type_produces_typed_as_edge(self):
+        """type = types.listOf types.str → typed_as edge."""
+        typed = self._typed_as_edges(self.services)
+        contexts = [e.get("context", "") for e in typed]
+        # The allowedHosts option has types.listOf types.str
+        assert any("listOf" in c for c in contexts), \
+            f"expected listOf in typed_as contexts: {contexts}"
+
+    def test_submodule_type_produces_typed_as_edge(self):
+        """type = types.submodule { ... } → typed_as edge."""
+        typed = self._typed_as_edges(self.services)
+        contexts = [e.get("context", "") for e in typed]
+        assert any("submodule" in c for c in contexts), \
+            f"expected submodule in typed_as contexts: {contexts}"
+
+    def test_enable_option_has_bool_type(self):
+        """mkEnableOption implicitly has types.bool."""
+        typed = self._typed_as_edges(self.services)
+        contexts = [e.get("context", "") for e in typed]
+        assert any("types.bool" in c for c in contexts), \
+            f"expected types.bool for enable option: {contexts}"
+
+    def test_port_type_extracted(self):
+        """type = types.port → typed_as edge."""
+        typed = self._typed_as_edges(self.services)
+        contexts = [e.get("context", "") for e in typed]
+        assert any("types.port" in c for c in contexts), \
+            f"expected types.port in typed_as contexts: {contexts}"
+
+    def test_typed_as_count(self):
+        """services/example.nix should have multiple typed_as edges."""
+        typed = self._typed_as_edges(self.services)
+        # enable(bool), package, port, settings(submodule), extraConfig(attrsOf),
+        # plus nested: verbose(bool), logLevel(enum), allowedHosts(listOf)
+        assert len(typed) >= 5, \
+            f"expected >= 5 typed_as edges, got {len(typed)}"
+
+    def test_editor_types_extracted(self):
+        """programs/editor.nix should also have typed_as edges."""
+        typed = self._typed_as_edges(self.editor)
+        assert len(typed) >= 3, \
+            f"expected >= 3 typed_as edges in editor, got {len(typed)}"
+
+    def test_typed_as_edge_completeness(self):
+        """All typed_as edges should have full fields."""
+        required = {"source", "target", "relation", "confidence",
+                     "source_file", "source_location", "weight"}
+        typed = self._typed_as_edges(self.services)
+        for e in typed:
+            missing = required - set(e.keys())
+            assert not missing, f"typed_as edge missing fields {missing}: {e}"

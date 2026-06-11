@@ -10632,6 +10632,80 @@ def _resolve_nix_import(path_text: str, source_file: Path) -> Path | None:
 _MAX_SNIPPET_LINES = 50
 
 
+def _extract_flake_lock(lock_path: Path) -> dict:
+    """Parse ``flake.lock`` JSON and create ``depends_on`` edges.
+
+    Each non-root node in the lock file becomes a synthetic dependency node.
+    GitHub inputs get labels like ``github:NixOS/nixpkgs@deadbee``;
+    path inputs get the local path as label.
+
+    Returns ``{"nodes": [...], "edges": [...]}`` matching the standard
+    per-file extraction format.  The edges point *from* the sibling
+    ``flake.nix`` file node *to* each input node.
+    """
+    import json as _json
+
+    try:
+        raw = lock_path.read_text(encoding="utf-8")
+        data = _json.loads(raw)
+    except Exception:
+        return {"nodes": [], "edges": []}
+
+    nodes_map = data.get("nodes", {})
+    if not isinstance(nodes_map, dict):
+        return {"nodes": [], "edges": []}
+
+    # The flake.nix file node ID is derived from the sibling flake.nix path.
+    flake_nix = lock_path.parent / "flake.nix"
+    if not flake_nix.exists():
+        return {"nodes": [], "edges": []}
+
+    flake_nid = _make_id(str(flake_nix))
+    str_lock = str(lock_path)
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for name, entry in nodes_map.items():
+        if name == "root":
+            continue  # skip the root meta-entry
+
+        locked = entry.get("locked", {})
+        if not isinstance(locked, dict):
+            continue
+
+        lock_type = locked.get("type", "")
+
+        if lock_type == "github":
+            owner = locked.get("owner", "unknown")
+            repo = locked.get("repo", "unknown")
+            rev = locked.get("rev", "")[:7]
+            label = f"github:{owner}/{repo}@{rev}" if rev else f"github:{owner}/{repo}"
+        elif lock_type == "path":
+            label = locked.get("path", name)
+        else:
+            # Fallback for other types (tarball, git, etc.)
+            label = f"{lock_type}:{name}" if lock_type else name
+
+        input_nid = _make_id("flake_input", name)
+        if input_nid not in seen_ids:
+            seen_ids.add(input_nid)
+            nodes.append({
+                "id": input_nid, "label": label, "file_type": "dependency",
+                "source_file": str_lock, "source_location": "L1",
+            })
+
+        edges.append({
+            "source": flake_nid, "target": input_nid,
+            "relation": "depends_on", "confidence": "EXTRACTED",
+            "source_file": str_lock, "source_location": "L1",
+            "weight": 1.0, "context": "flake_input",
+        })
+
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_nix(path: Path) -> dict:
     """Extract semantic nodes and edges from a .nix file via tree-sitter.
 
@@ -11083,11 +11157,17 @@ def _extract_nix_treesitter(path: Path) -> dict:
             walk(child, parent_nid)
 
     def _check_nix_option_pattern(expr_node, name_text: str, parent_nid: str, line: int) -> None:
-        """Detect mkOption / mkEnableOption patterns, handling curried application."""
+        """Detect mkOption / mkEnableOption patterns, handling curried application.
+
+        When a ``type`` binding is found in the argument attrset of ``mkOption``,
+        creates a ``typed_as`` edge from the option node to a synthetic type node.
+        ``mkEnableOption`` implicitly has type ``types.bool``.
+        """
         target = expr_node
         # Unwrap curried application to find the innermost function
         while target.type == "apply_expression":
             callee = target.child_by_field_name("function")
+            arg = target.child_by_field_name("argument")
             if callee is None:
                 break
             callee_text = text(callee)
@@ -11095,14 +11175,57 @@ def _extract_nix_treesitter(path: Path) -> dict:
                 opt_nid = _make_id(module_scope, name_text)
                 add_node(opt_nid, f"options.{name_text}", line)
                 add_edge(parent_nid, opt_nid, "contains", line)
+                # Extract type annotation from the argument attrset
+                _extract_option_type(arg, opt_nid, line)
                 return
             elif "mkEnableOption" in callee_text:
                 opt_nid = _make_id(module_scope, "enable")
                 add_node(opt_nid, "enable", line)
                 add_edge(parent_nid, opt_nid, "contains", line)
+                # mkEnableOption implicitly has type types.bool
+                type_nid = _make_id("nix_type", "bool")
+                add_node(type_nid, "types.bool", line)
+                add_edge(opt_nid, type_nid, "typed_as", line, context="types.bool")
                 return
             # Try inner function (for curried calls)
             target = callee
+
+    def _extract_option_type(attrset_node, opt_nid: str, line: int) -> None:
+        """Walk an mkOption argument attrset for a ``type`` binding.
+
+        Creates a ``typed_as`` edge from the option node to a type node.
+        The attrset AST is: attrset_expression → binding_set → binding*
+        """
+        if attrset_node is None or attrset_node.type != "attrset_expression":
+            return
+
+        # The bindings live inside a binding_set child, not directly
+        # under the attrset_expression.
+        for child in attrset_node.named_children:
+            bindings = child.named_children if child.type == "binding_set" else [child]
+            for binding in bindings:
+                if binding.type != "binding":
+                    continue
+                attr_path = binding.child_by_field_name("attrpath")
+                if attr_path is None:
+                    continue
+                if text(attr_path) != "type":
+                    continue
+
+                # Found the type binding — extract the expression text
+                expr = binding.child_by_field_name("expression")
+                if expr is None:
+                    continue
+
+                type_text = text(expr).strip()
+                type_label = type_text
+                # Create a short form for the node ID (strip compound args like submodule { ... })
+                type_short = type_text.split("{")[0].strip()
+
+                type_nid = _make_id("nix_type", type_short)
+                add_node(type_nid, type_label, line)
+                add_edge(opt_nid, type_nid, "typed_as", line, context=type_text)
+                return
 
     def _check_import_expr(node, parent_nid: str, line: int) -> None:
         """Detect import ./path and callPackage ./path {} patterns."""
@@ -11576,6 +11699,16 @@ def extract(
                 file=sys.stderr,
                 flush=True,
             )
+
+    # flake.lock processing: parse locked inputs to create depends_on edges.
+    # The generic JSON extractor creates structural nodes; this pass adds
+    # semantic dependency edges from flake.nix → each locked input.
+    for i, p in enumerate(paths):
+        if p.name == "flake.lock":
+            lock_result = _extract_flake_lock(p)
+            if lock_result["nodes"] or lock_result["edges"]:
+                per_file[i]["nodes"].extend(lock_result["nodes"])
+                per_file[i]["edges"].extend(lock_result["edges"])
 
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
