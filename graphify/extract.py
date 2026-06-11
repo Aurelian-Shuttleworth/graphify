@@ -10911,6 +10911,151 @@ def _batch_lsp_enrich_nix(
 
             resync_count = client.resync_count
 
+            # --- Pass 2: Cross-file references + callPackage produces ---
+            # Build a map of file paths → their node IDs and extraction results
+            # for cross-file edge resolution.
+            file_uri_to_idx: dict[str, int] = {}
+            file_path_to_nid: dict[str, str] = {}
+            for idx in nix_indices:
+                p = paths[idx].absolute()
+                uri = f"file://{p}"
+                file_uri_to_idx[uri] = idx
+                file_path_to_nid[str(p)] = _make_id(str(paths[idx]))
+
+            xref_edges_added = 0
+            produces_edges_added = 0
+            _MAX_XREF_QUERIES = 100
+            queries_made = 0
+
+            for idx in nix_indices:
+                if queries_made >= _MAX_XREF_QUERIES:
+                    break
+                path = paths[idx]
+                result = per_file[idx]
+                abs_path = path.absolute()
+                file_uri = f"file://{abs_path}"
+                str_path_val = str(path)
+
+                try:
+                    source_text = path.read_text(encoding="utf-8", errors="replace")
+                    client.did_open(file_uri, source_text)
+                except Exception:
+                    continue
+
+                # Gather top-level nodes for this file (skip file-level nodes)
+                file_nid = _make_id(str(path))
+                top_nodes = [
+                    n for n in result.get("nodes", [])
+                    if n["id"] != file_nid
+                    and not n["id"].endswith("__module")
+                    and n.get("source_file") == str_path_val
+                ]
+
+                existing_edge_triples = {
+                    (e["source"], e["target"], e["relation"])
+                    for e in result.get("edges", [])
+                }
+
+                for node in top_nodes:
+                    if queries_made >= _MAX_XREF_QUERIES:
+                        break
+
+                    # Parse source_location "L{line}" to 0-indexed line
+                    loc = node.get("source_location", "")
+                    if not loc.startswith("L"):
+                        continue
+                    try:
+                        line_0 = int(loc[1:]) - 1
+                    except ValueError:
+                        continue
+
+                    # --- Cross-file references ---
+                    refs = client.references(file_uri, line_0, 0)
+                    queries_made += 1
+
+                    for ref in refs:
+                        ref_uri = ref.get("uri", "")
+                        if ref_uri == file_uri:
+                            continue  # skip same-file
+                        if ref_uri not in file_uri_to_idx:
+                            continue  # skip files outside extraction set
+
+                        # Find or create target node
+                        target_idx = file_uri_to_idx[ref_uri]
+                        target_file_nid = _make_id(str(paths[target_idx]))
+
+                        triple = (node["id"], target_file_nid, "references")
+                        if triple not in existing_edge_triples:
+                            result.setdefault("edges", []).append({
+                                "source": node["id"],
+                                "target": target_file_nid,
+                                "relation": "references",
+                                "confidence": "EXTRACTED",
+                                "source_file": str_path_val,
+                                "source_location": loc,
+                                "weight": 0.8,
+                                "context": "lsp_xref",
+                            })
+                            existing_edge_triples.add(triple)
+                            xref_edges_added += 1
+
+                # --- CallPackage produces edges ---
+                # Find callPackage edges from tree-sitter and verify via LSP
+                callpkg_edges = [
+                    e for e in result.get("edges", [])
+                    if e.get("context") == "callPackage"
+                    and e.get("relation") == "imports_from"
+                ]
+
+                for cpkg_edge in callpkg_edges:
+                    if queries_made >= _MAX_XREF_QUERIES:
+                        break
+
+                    source_nid = cpkg_edge["source"]
+                    loc = cpkg_edge.get("source_location", "")
+                    if not loc.startswith("L"):
+                        continue
+                    try:
+                        line_0 = int(loc[1:]) - 1
+                    except ValueError:
+                        continue
+
+                    defs = client.definition(file_uri, line_0, 0)
+                    queries_made += 1
+
+                    for defn in defs:
+                        def_uri = defn.get("uri", "")
+                        if def_uri == file_uri:
+                            continue
+                        if def_uri in file_uri_to_idx:
+                            target_idx = file_uri_to_idx[def_uri]
+                            target_nid = _make_id(str(paths[target_idx]))
+                            triple = (source_nid, target_nid, "produces")
+                            if triple not in existing_edge_triples:
+                                result.setdefault("edges", []).append({
+                                    "source": source_nid,
+                                    "target": target_nid,
+                                    "relation": "produces",
+                                    "confidence": "EXTRACTED",
+                                    "source_file": str_path_val,
+                                    "source_location": loc,
+                                    "weight": 0.9,
+                                    "context": "callPackage",
+                                })
+                                existing_edge_triples.add(triple)
+                                produces_edges_added += 1
+
+                try:
+                    client.did_close(file_uri)
+                except Exception:
+                    pass
+
+            if xref_edges_added or produces_edges_added:
+                logger.info(
+                    "Cross-file resolution: %d xref edges, %d produces edges (%d queries)",
+                    xref_edges_added, produces_edges_added, queries_made,
+                )
+
     except Exception as e:
         import logging
 

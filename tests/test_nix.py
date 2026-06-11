@@ -931,3 +931,130 @@ class TestOptionTypeExtraction:
         for e in typed:
             missing = required - set(e.keys())
             assert not missing, f"typed_as edge missing fields {missing}: {e}"
+
+
+# ── Cross-File Reference Tests ───────────────────────────────────────────────
+
+@_needs_nix_lsp
+@_needs_nix
+class TestCrossFileReferences:
+    """Validate cross-file reference edges via LSP batch enrichment."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _batch_extract(self, request):
+        from graphify.extract import extract
+
+        nix_files = sorted(FIXTURE_FLAKE.rglob("*.nix"))
+        result = extract(nix_files, cache_root=FIXTURE_FLAKE)
+
+        request.cls.all_nodes = result["nodes"]
+        request.cls.all_edges = result["edges"]
+
+    def _xref_edges(self):
+        return [e for e in self.all_edges if e.get("context") == "lsp_xref"]
+
+    def test_no_same_file_reference_edges(self):
+        """Same-file refs should be filtered out."""
+        for e in self._xref_edges():
+            assert e["source"] != e["target"], \
+                f"xref edge should not be same-file: {e}"
+
+    def test_references_context_is_lsp_xref(self):
+        """All cross-file ref edges should have lsp_xref context."""
+        xrefs = self._xref_edges()
+        for e in xrefs:
+            assert e["context"] == "lsp_xref"
+            assert e["relation"] == "references"
+
+    def test_xref_edge_completeness(self):
+        """All xref edges should have full fields."""
+        required = {"source", "target", "relation", "confidence",
+                     "source_file", "source_location", "weight"}
+        for e in self._xref_edges():
+            missing = required - set(e.keys())
+            assert not missing, f"xref edge missing fields {missing}: {e}"
+
+    def test_references_deduplicated(self):
+        """No duplicate xref edges."""
+        xrefs = self._xref_edges()
+        triples = [(e["source"], e["target"], e["relation"]) for e in xrefs]
+        assert len(triples) == len(set(triples)), \
+            f"duplicate xref edges found"
+
+    def test_overall_no_regression(self):
+        """Batch extraction should still produce baseline edges."""
+        relations = {e["relation"] for e in self.all_edges}
+        assert "contains" in relations
+        assert "imports_from" in relations
+
+
+# ── CallPackage Definition Tests ─────────────────────────────────────────────
+
+@_needs_nix_lsp
+@_needs_nix
+class TestCallPackageDefinition:
+    """Validate produces edges from callPackage definition lookup."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _batch_extract(self, request):
+        from graphify.extract import extract
+
+        nix_files = sorted(FIXTURE_FLAKE.rglob("*.nix"))
+        result = extract(nix_files, cache_root=FIXTURE_FLAKE)
+
+        request.cls.all_nodes = result["nodes"]
+        request.cls.all_edges = result["edges"]
+
+    def _produces_edges(self):
+        return [e for e in self.all_edges if e["relation"] == "produces"]
+
+    def _callpackage_imports(self):
+        return [e for e in self.all_edges
+                if e.get("context") == "callPackage"
+                and e["relation"] == "imports_from"]
+
+    def test_callpackage_imports_exist(self):
+        """Tree-sitter should detect callPackage imports_from edges."""
+        imports = self._callpackage_imports()
+        assert len(imports) >= 1, \
+            f"expected callPackage imports_from edges, got {len(imports)}"
+
+    def test_produces_edge_has_callpackage_context(self):
+        """If produces edges exist, they should have callPackage context."""
+        for e in self._produces_edges():
+            assert e.get("context") == "callPackage", \
+                f"produces edge should have callPackage context: {e}"
+
+    def test_produces_edge_completeness(self):
+        """All produces edges should have full fields."""
+        required = {"source", "target", "relation", "confidence",
+                     "source_file", "source_location", "weight"}
+        for e in self._produces_edges():
+            missing = required - set(e.keys())
+            assert not missing, f"produces edge missing fields {missing}: {e}"
+
+    def test_no_produces_without_lsp(self):
+        """Graceful degradation: single-file extraction has no produces edges."""
+        extract_nix = _import_extract_nix()
+        result = extract_nix(FIXTURE_FLAKE / "flake.nix")
+        produces = [e for e in result["edges"] if e["relation"] == "produces"]
+        assert len(produces) == 0, \
+            "single-file extraction should not create produces edges"
+
+    def test_print_cross_file_summary(self):
+        """Print a summary of cross-file edges."""
+        xrefs = [e for e in self.all_edges if e.get("context") == "lsp_xref"]
+        produces = self._produces_edges()
+        callpkg = self._callpackage_imports()
+        print("\n" + "=" * 60)
+        print("CROSS-FILE RESOLUTION SUMMARY")
+        print("=" * 60)
+        print(f"LSP xref edges: {len(xrefs)}")
+        print(f"Produces edges: {len(produces)}")
+        print(f"CallPackage imports_from: {len(callpkg)}")
+        relations = {}
+        for e in self.all_edges:
+            r = e["relation"]
+            relations[r] = relations.get(r, 0) + 1
+        print(f"All relations: {relations}")
+        print("=" * 60)
