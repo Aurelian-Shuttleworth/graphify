@@ -10712,7 +10712,10 @@ def extract_nix(path: Path) -> dict:
     LSP enrichment (hierarchical labels, source snippets) is applied as a
     batch post-pass in extract() when the ``nil`` LSP server is available.
     This function focuses purely on structural + semantic extraction.
+    Also handles ``flake.lock`` JSON files for dependency extraction.
     """
+    if path.name == "flake.lock":
+        return _extract_flake_lock(path)
     return _extract_nix_treesitter(path)
 
 
@@ -11227,7 +11230,9 @@ def _extract_nix_treesitter(path: Path) -> dict:
         add_edge(file_nid, entry_nid, "contains", 1)
 
     # --- Pass 1: walk ---
-    def walk(node, parent_nid: str) -> None:
+    def walk(node, parent_nid: str, with_scopes: list[str] | None = None) -> None:
+        if with_scopes is None:
+            with_scopes = []
         line = node.start_point[0] + 1
 
         # ── binding: name = value; ──
@@ -11268,7 +11273,7 @@ def _extract_nix_treesitter(path: Path) -> dict:
                     _check_import_expr(expr, parent_nid, line)
 
                 # Always recurse into the expression value for nested patterns
-                walk(expr, binding_parent_nid)
+                walk(expr, binding_parent_nid, with_scopes)
             return  # don't recurse into binding children via default path
 
         # ── import / callPackage at expression level ──
@@ -11278,19 +11283,33 @@ def _extract_nix_treesitter(path: Path) -> dict:
         # ── inherit (with source) — `inherit (src) x y;` ──
         if node.type == "inherit_from":
             from_node = None
+            inherited_names: list[tuple[str, object]] = []
             for child in node.named_children:
-                if child.type not in ("identifier", "attrpath"):
-                    # The source expression (e.g. `defaults` in `inherit (defaults) ...`)
-                    if from_node is None and child.type != "inherit_from":
-                        from_node = child
-                    continue
-                sym_name = text(child)
+                if child.type == "variable_expression" and from_node is None:
+                    # The source expression (e.g. `pkgs` in `inherit (pkgs) ...`)
+                    from_node = child
+                elif child.type == "inherited_attrs":
+                    # The inherited names are identifier children of inherited_attrs
+                    for gc in child.named_children:
+                        if gc.type == "identifier":
+                            inherited_names.append((text(gc), gc))
+                elif child.type in ("identifier", "attrpath"):
+                    # Fallback for older grammar versions
+                    inherited_names.append((text(child), child))
+            for sym_name, sym_node in inherited_names:
                 sym_nid = _make_id(stem, sym_name)
                 add_node(sym_nid, sym_name, line)
                 if from_node is not None:
                     from_text = text(from_node)
                     from_nid = ensure_named_node(from_text, line)
                     add_edge(sym_nid, from_nid, "imports_from", line, context="inherit")
+                    # V3: inherit (pkgs) x y → depends_on pkgs.x, pkgs.y
+                    if from_text == "pkgs":
+                        dep_label = f"pkgs.{sym_name}"
+                        dep_nid = _make_id(dep_label)
+                        add_node(dep_nid, dep_label, sym_node.start_point[0] + 1)
+                        add_edge(file_nid, dep_nid, "depends_on", sym_node.start_point[0] + 1,
+                                 context="inherit_pkg")
                 else:
                     add_edge(parent_nid, sym_nid, "contains", line)
             return
@@ -11298,7 +11317,15 @@ def _extract_nix_treesitter(path: Path) -> dict:
         # ── inherit (plain) — `inherit x y;` ──
         if node.type == "inherit":
             for child in node.named_children:
-                if child.type in ("identifier", "attrpath"):
+                if child.type == "inherited_attrs":
+                    for gc in child.named_children:
+                        if gc.type == "identifier":
+                            sym_name = text(gc)
+                            sym_nid = _make_id(stem, sym_name)
+                            add_node(sym_nid, sym_name, line)
+                            add_edge(parent_nid, sym_nid, "contains", line)
+                elif child.type in ("identifier", "attrpath"):
+                    # Fallback for older grammar versions
                     sym_name = text(child)
                     sym_nid = _make_id(stem, sym_name)
                     add_node(sym_nid, sym_name, line)
@@ -11308,28 +11335,30 @@ def _extract_nix_treesitter(path: Path) -> dict:
         # ── binding_set (wrapper inside let_expression) ──
         if node.type == "binding_set":
             for child in node.named_children:
-                walk(child, parent_nid)
+                walk(child, parent_nid, with_scopes)
             return
 
         # ── let expression ──
         if node.type == "let_expression":
             for child in node.named_children:
-                walk(child, parent_nid)
+                walk(child, parent_nid, with_scopes)
             body = node.child_by_field_name("body")
             if body is not None:
-                walk(body, parent_nid)
+                walk(body, parent_nid, with_scopes)
             return
 
         # ── with expression ──
         if node.type == "with_expression":
             env = node.child_by_field_name("environment")
+            new_scopes = list(with_scopes)  # copy
             if env is not None:
                 scope_name = text(env)
                 scope_nid = ensure_named_node(scope_name, line)
                 add_edge(parent_nid, scope_nid, "references", line, context="with_scope")
+                new_scopes.append(scope_name)
             body = node.child_by_field_name("body")
             if body is not None:
-                walk(body, parent_nid)
+                walk(body, parent_nid, new_scopes)
             return
 
         # ── function expression (top-level anonymous) ──
@@ -11337,7 +11366,7 @@ def _extract_nix_treesitter(path: Path) -> dict:
             # If this is the module body function, walk its body
             body = node.child_by_field_name("body")
             if body is not None:
-                walk(body, parent_nid)
+                walk(body, parent_nid, with_scopes)
             return
 
         # ── mkIf detection ──
@@ -11359,10 +11388,11 @@ def _extract_nix_treesitter(path: Path) -> dict:
                         # Walk the body argument (the second curried arg)
                         body_arg = node.child_by_field_name("argument")
                         if body_arg is not None:
-                            walk(body_arg, parent_nid)
+                            walk(body_arg, parent_nid, with_scopes)
                         return
 
         # ── list of path imports: imports = [ ./a ./b ] ──
+        # V3: Also extract package identifiers from `with pkgs; [...]` lists
         if node.type == "list_expression":
             for child in node.named_children:
                 if child.type == "path_expression":
@@ -11371,6 +11401,39 @@ def _extract_nix_treesitter(path: Path) -> dict:
                     if resolved:
                         tgt_nid = _make_id(str(resolved))
                         add_edge(parent_nid, tgt_nid, "imports_from", line, context="import")
+                elif child.type == "variable_expression" and with_scopes:
+                    # V3: bare identifier inside `with pkgs; [...]` → depends_on
+                    # tree-sitter-nix uses variable_expression (not identifier) for names in lists
+                    ident = text(child)
+                    if ident not in defined_names and ident not in _NIX_BUILTIN_BLOCKLIST:
+                        scope = with_scopes[-1]  # innermost with scope
+                        pkg_label = f"{scope}.{ident}"
+                        pkg_nid = _make_id(pkg_label)
+                        add_node(pkg_nid, pkg_label, child.start_point[0] + 1)
+                        add_edge(file_nid, pkg_nid, "depends_on", child.start_point[0] + 1,
+                                 context="with_list_item")
+                elif child.type == "select_expression" and with_scopes:
+                    # V3: qualified reference like `pkgs.rubyPackages_3_4.ruby-lsp` inside list
+                    sel_text = text(child)
+                    pkg_nid = _make_id(sel_text)
+                    add_node(pkg_nid, sel_text, child.start_point[0] + 1)
+                    add_edge(file_nid, pkg_nid, "depends_on", child.start_point[0] + 1,
+                             context="with_list_item")
+                elif child.type in ("apply_expression", "parenthesized_expression") and with_scopes:
+                    # V3: function calls inside list like `writeShellApplication { ... }`
+                    # or parenthesized: `(writeShellApplication { ... })`
+                    inner = child
+                    if child.type == "parenthesized_expression" and child.named_child_count == 1:
+                        inner = child.named_children[0]
+                    if inner.type == "apply_expression":
+                        fn = inner.child_by_field_name("function")
+                        if fn is not None:
+                            fn_text = text(fn)
+                            if fn_text not in _NIX_BUILTIN_BLOCKLIST:
+                                pkg_nid = _make_id(f"inline:{fn_text}")
+                                add_node(pkg_nid, f"({fn_text} ...)", child.start_point[0] + 1)
+                                add_edge(file_nid, pkg_nid, "depends_on", child.start_point[0] + 1,
+                                         context="inline_derivation")
 
         # ── config.X.Y references ──
         if node.type == "select_expression":
@@ -11383,7 +11446,7 @@ def _extract_nix_treesitter(path: Path) -> dict:
 
         # ── Default: recurse into children ──
         for child in node.named_children:
-            walk(child, parent_nid)
+            walk(child, parent_nid, with_scopes)
 
     def _check_nix_option_pattern(expr_node, name_text: str, parent_nid: str, line: int) -> None:
         """Detect mkOption / mkEnableOption patterns, handling curried application.

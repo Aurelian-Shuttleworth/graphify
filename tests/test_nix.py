@@ -1058,3 +1058,90 @@ class TestCallPackageDefinition:
             relations[r] = relations.get(r, 0) + 1
         print(f"All relations: {relations}")
         print("=" * 60)
+
+
+# ── V3: With-List Item Extraction Tests ──────────────────────────────────────
+
+@_needs_nix
+class TestV3WithListItems:
+    """V3: Validate with-scope list item extraction on nix-v3.nix fixture."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _extract(self, request):
+        extract_nix = _import_extract_nix()
+        request.cls.result = extract_nix(FIXTURES / "nix-v3.nix")
+
+    def _depends_on(self, context=None):
+        return [
+            e for e in self.result["edges"]
+            if e["relation"] == "depends_on"
+            and (context is None or e.get("context") == context)
+        ]
+
+    def _dep_targets(self, context=None):
+        nid_to_label = {n["id"]: n["label"] for n in self.result["nodes"]}
+        return {nid_to_label.get(e["target"], e["target"]) for e in self._depends_on(context)}
+
+    def test_bare_identifiers_produce_depends_on(self):
+        """with pkgs; [crane cosign dive] → pkgs.crane, pkgs.cosign, pkgs.dive."""
+        targets = self._dep_targets("with_list_item")
+        for pkg in ("pkgs.crane", "pkgs.cosign", "pkgs.dive"):
+            assert pkg in targets, f"expected {pkg} in depends_on targets: {targets}"
+
+    def test_nested_with_uses_innermost_scope(self):
+        """with pkgs; with lib; [mkMerge mkForce] → lib.mkMerge, lib.mkForce."""
+        targets = self._dep_targets("with_list_item")
+        assert "lib.mkMerge" in targets, f"expected lib.mkMerge: {targets}"
+        assert "lib.mkForce" in targets, f"expected lib.mkForce: {targets}"
+
+    def test_qualified_references_in_list(self):
+        """select_expressions like rubyPackages_3_4.ruby-lsp inside with lists."""
+        targets = self._dep_targets("with_list_item")
+        assert "rubyPackages_3_4.ruby-lsp" in targets, f"expected qualified ref: {targets}"
+        assert "nodePackages.typescript-language-server" in targets, f"expected qualified ref: {targets}"
+
+    def test_inline_derivation_detected(self):
+        """(writeShellApplication {...}) produces inline_derivation edge."""
+        targets = self._dep_targets("inline_derivation")
+        assert any("writeShellApplication" in t for t in targets), \
+            f"expected writeShellApplication inline derivation: {targets}"
+
+    def test_inherit_pkgs_produces_depends_on(self):
+        """inherit (pkgs) git curl wget → depends_on pkgs.git, pkgs.curl, pkgs.wget."""
+        targets = self._dep_targets("inherit_pkg")
+        for pkg in ("pkgs.git", "pkgs.curl", "pkgs.wget"):
+            assert pkg in targets, f"expected {pkg} in inherit_pkg targets: {targets}"
+
+    def test_inherit_from_produces_imports_from(self):
+        """inherit (pkgs) git → imports_from edge from git to pkgs."""
+        inherit_edges = _edge_labels(self.result, "imports_from", context="inherit")
+        assert ("git", "pkgs") in inherit_edges, f"expected git→pkgs inherit: {inherit_edges}"
+        assert ("curl", "pkgs") in inherit_edges, f"expected curl→pkgs inherit: {inherit_edges}"
+
+    def test_inherit_lib_no_depends_on(self):
+        """inherit (lib) mkOption → no depends_on (only pkgs triggers depends_on)."""
+        targets = self._dep_targets("inherit_pkg")
+        for name in ("lib.mkOption", "lib.mkEnableOption"):
+            assert name not in targets, f"unexpected {name} in inherit_pkg: {targets}"
+
+    def test_depends_on_edges_source_from_file(self):
+        """All depends_on edges should source from the file node."""
+        from graphify.extract import _make_id
+        file_nid = _make_id(str(FIXTURES / "nix-v3.nix"))
+        for e in self._depends_on():
+            assert e["source"] == file_nid, \
+                f"depends_on edge should source from file: {e}"
+
+    def test_depends_on_edge_field_completeness(self):
+        """Every depends_on edge has all required fields."""
+        required = {"source", "target", "relation", "confidence",
+                     "source_file", "source_location", "weight"}
+        for e in self._depends_on():
+            missing = required - set(e.keys())
+            assert not missing, f"edge missing fields {missing}: {e}"
+
+    def test_total_depends_on_count(self):
+        """Sanity check: expect at least 15 depends_on edges from the fixture."""
+        total = len(self._depends_on())
+        assert total >= 15, f"expected >= 15 depends_on edges, got {total}"
+

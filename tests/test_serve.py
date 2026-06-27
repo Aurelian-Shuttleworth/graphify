@@ -15,7 +15,7 @@ from graphify.serve import (
     _filter_graph_by_context,
     _infer_context_filters,
     _query_terms,
-    _query_graph_text,
+    _query_graph,
     _resolve_context_filters,
     _subgraph_to_text,
     _load_graph,
@@ -115,10 +115,10 @@ def test_query_terms_filters_only_short_english_terms(monkeypatch):
     assert terms == ["前端", "dependency", "依赖", "install", "安装", "包", "管理器", "包管理器", "项目", "约定", "项目约定", "前", "a前"]
 
 
-def test_query_graph_text_keeps_short_non_english_terms():
+def test_query_graph_keeps_short_non_english_terms():
     G = nx.Graph()
     G.add_node("frontend", label="前端", source_file="docs/前端.md", source_location="L1", community=0)
-    text = _query_graph_text(G, "前端", mode="bfs", depth=1)
+    text = _query_graph(G, "前端", mode="bfs", depth=1)
     assert "No matching nodes found." not in text
     assert "NODE 前端" in text
 
@@ -210,17 +210,17 @@ def test_subgraph_to_text_includes_edge_context():
     assert "context=call" in text
 
 
-def test_query_graph_text_explicit_context_filter_changes_traversal():
+def test_query_graph_explicit_context_filter_changes_traversal():
     G = _make_graph()
-    text = _query_graph_text(G, "extract", mode="bfs", depth=2, token_budget=2000, context_filters=["call"])
+    text = _query_graph(G, "extract", mode="bfs", depth=2, token_budget=2000, context_filters=["call"])
     assert "Context: call (explicit)" in text
     assert "cluster" in text
     assert "build" not in text
 
 
-def test_query_graph_text_heuristic_context_filter_changes_traversal():
+def test_query_graph_heuristic_context_filter_changes_traversal():
     G = _make_graph()
-    text = _query_graph_text(G, "who calls extract", mode="bfs", depth=2, token_budget=2000)
+    text = _query_graph(G, "who calls extract", mode="bfs", depth=2, token_budget=2000)
     assert "Context: call (heuristic)" in text
     assert "cluster" in text
     assert "build" not in text
@@ -433,14 +433,14 @@ def test_query_seeds_from_identifier_not_noise():
     """'FooBarService error handling' should expand from FooBarService,
     not from error-handler nodes, so ServiceClient appears in results."""
     G = _make_noisy_graph()
-    text = _query_graph_text(G, "FooBarService error handling", mode="bfs", depth=2)
+    text = _query_graph(G, "FooBarService error handling", mode="bfs", depth=2)
     assert "FooBarService" in text
     assert "ServiceClient" in text
 
 
-def test_query_graph_text_parameter_type_context_filter_changes_traversal():
+def test_query_graph_parameter_type_context_filter_changes_traversal():
     import networkx as nx
-    from graphify.serve import _query_graph_text
+    from graphify.serve import _query_graph
 
     graph = nx.Graph()
     graph.add_node("process", label="process", source_file="sample.cs", source_location="L20")
@@ -449,14 +449,14 @@ def test_query_graph_text_parameter_type_context_filter_changes_traversal():
     graph.add_edge("process", "payload", relation="references", context="parameter_type", confidence="EXTRACTED")
     graph.add_edge("process", "other", relation="calls", context="call", confidence="EXTRACTED")
 
-    text = _query_graph_text(graph, "who accepts Payload", context_filters=["parameter_type"])
+    text = _query_graph(graph, "who accepts Payload", context_filters=["parameter_type"])
 
     assert "parameter_type" in text
     assert "Payload" in text
     assert "PayloadFactory" not in text
 
 
-def test_query_graph_text_context_filter_aliases_resolve():
+def test_query_graph_context_filter_aliases_resolve():
     import networkx as nx
     from graphify.serve import _normalize_context_filters
 
@@ -536,6 +536,6 @@ def test_query_text_chinese_finds_routing_nodes():
     G.add_node("parent", label="页面路由规范", source_file="doc.md", source_location="L1", community=0)
     G.add_node("child", label="路由桥接核对表", source_file="doc.md", source_location="L10", community=0)
     G.add_edge("parent", "child", relation="contains", confidence="EXTRACTED")
-    text = _query_graph_text(G, "页面路由", mode="bfs", depth=2)
+    text = _query_graph(G, "页面路由", mode="bfs", depth=2)
     assert "No matching nodes found." not in text
     assert "路由" in text

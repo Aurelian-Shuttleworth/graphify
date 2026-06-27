@@ -154,8 +154,21 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
             if t in source:
                 score += _SOURCE_MATCH_BONUS * w
         if score > 0:
+            # V3: Degree-based boost — high-connectivity nodes are more likely
+            # to be architecturally significant starting points for BFS.
+            degree = G.degree(nid)
+            if degree > 5:
+                score *= (1.0 + math.log2(degree) * 0.1)
+            # V3: File-node bonus — nodes whose labels end in .nix, .py, etc.
+            # or that match a filename pattern are better BFS seeds because
+            # they sit at module boundaries and connect to many children.
+            if norm_label.endswith((".nix", ".py", ".ts", ".js", ".go", ".rs")):
+                score *= 1.5
+            elif " module" in norm_label:
+                score *= 1.3
             scored.append((score, nid))
     return sorted(scored, reverse=True)
+
 
 
 def _pick_seeds(scored: list[tuple[float, str]], max_k: int = 3, gap_ratio: float = 0.2) -> list[str]:
@@ -512,13 +525,15 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
     """Start the MCP server. Requires pip install mcp."""
     import threading
 
-    try:
-        from mcp.server import Server
-        from mcp.server.stdio import stdio_server
-        from mcp import types
-        from mcp.types import AnyUrl
-    except ImportError as e:
-        raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
+    import importlib.util
+
+    if importlib.util.find_spec("mcp") is None:
+        raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"')
+
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+    from mcp import types
+    from mcp.types import AnyUrl
 
     G = _load_graph(graph_path)
     communities = _communities_from_graph(G)
